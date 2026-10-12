@@ -32,6 +32,9 @@ def test_supported_versions_produce_reference_table(
     assert result.report.all_passed is True
     assert result.report.checks["key_table_shape"].details["key_count"] == 90
     assert json.dumps(result.keys, indent=2, sort_keys=True) == ref_keys_json.read_text(encoding="utf-8")
+    # 4.3.0 also carries a v1 signature; the SSAID uses only the v2 signer.
+    assert result.signers["scheme"] == "v2"
+    assert result.signers["sha256"] == ["397e98abed03c5f263ffaf4e8a1043b2a59f538b99e75cf152fa05a7e8007d8d"]
 
 
 def test_legacy_version_3263_is_rejected(happ_apk: Callable[[str], Path]) -> None:

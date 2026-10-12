@@ -69,10 +69,12 @@ def run_extract(args: argparse.Namespace) -> int:
     # Save outputs if not verify-only
     if not args.verify_only:
         if args.output:
-            result.save(args.output, meta_path=args.meta)
+            result.save(args.output, meta_path=args.meta, signers_path=args.signers)
             print(f"Saved {len(result.keys)} keys to {args.output}", file=sys.stderr)
             if args.meta:
                 print(f"Saved metadata to {args.meta}", file=sys.stderr)
+            if args.signers:
+                print(f"Saved signers to {args.signers}", file=sys.stderr)
         elif not args.verify_only:
             print("Warning: -o/--output not specified, keys not saved to disk", file=sys.stderr)
 
@@ -153,7 +155,10 @@ def run_happ_sub_sync(args: argparse.Namespace) -> int:
     entries = happ_sub.table_from_keys_json(keys)
     repo = Path(args.repo)
     try:
-        plan = happ_sub.plan_sync(repo, entries, str(meta["app_version"]))
+        signers = None
+        if args.signers:
+            signers = happ_sub.signers_from_json(json.loads(Path(args.signers).read_text(encoding="utf-8")))
+        plan = happ_sub.plan_sync(repo, entries, str(meta["app_version"]), signers)
         written = happ_sub.apply_sync(repo, plan, entries) if args.write else []
     except happ_sub.HappSubFormatError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -180,6 +185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     extract_p.add_argument("apk", help="Path to Happ Android APK")
     extract_p.add_argument("-o", "--output", help="Output path for keys.json")
     extract_p.add_argument("--meta", help="Output path for meta.json")
+    extract_p.add_argument("--signers", help="Output path for signers.json (APK signer certificates)")
     extract_p.add_argument(
         "--report",
         choices=["text", "json"],
@@ -219,13 +225,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     sync_p = subparsers.add_parser(
         "happ-sub-sync",
-        help="Compare an extracted table with happ-sub's tables and generate the next generation on drift",
+        help="Compare an extraction with happ-sub (key tables, signers) and generate the changed sources on drift",
     )
     sync_p.add_argument("--keys", required=True, help="keys.json written by `extract -o`")
     sync_p.add_argument("--meta", required=True, help="meta.json written by `extract --meta`")
     sync_p.add_argument("--report", required=True, help="JSON report printed by `extract --report json`")
+    sync_p.add_argument("--signers", help="signers.json written by `extract --signers`; compared with signers.rs")
     sync_p.add_argument("--repo", required=True, help="Path to a happ-sub checkout")
-    sync_p.add_argument("--write", action="store_true", help="Write gen<N>.rs and update mod.rs on drift")
+    sync_p.add_argument(
+        "--write",
+        action="store_true",
+        help="On drift, write gen<N>.rs and src/keys/mod.rs, or signers.rs and src/device/mod.rs",
+    )
     sync_p.add_argument("--pr-body", help="Write a pull request body (Markdown) here on drift")
     sync_p.add_argument("--run-url", help="CI run URL to cite in the pull request body")
 

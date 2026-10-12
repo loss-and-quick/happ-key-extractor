@@ -120,7 +120,7 @@ jobs:
         run: |
           status=0
           python -m happ_keys extract "$RUNNER_TEMP/apk/Happ.apk" \
-            -o out/keys.json --meta out/meta.json --report json > out/report.json || status=$?
+            -o out/keys.json --meta out/meta.json --signers out/signers.json --report json > out/report.json || status=$?
           cat out/report.json
           exit "$status"
 
@@ -171,7 +171,7 @@ jobs:
           fi
 
   happ-sub-sync:
-    name: Sync tables with happ-sub
+    name: Sync tables and signers with happ-sub
     needs: extract
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
@@ -211,24 +211,24 @@ jobs:
           path: out
 
       # The generator only needs the standard library, so no dependency install here.
-      - name: Compare with happ-sub tables
+      - name: Compare with happ-sub
         id: sync
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python -m happ_keys happ-sub-sync \
-            --keys out/keys.json --meta out/meta.json --report out/report.json \
+            --keys out/keys.json --meta out/meta.json --report out/report.json --signers out/signers.json \
             --repo happ-sub --write --pr-body out/pr-body.md --run-url "$RUN_URL" > out/sync.json
           cat out/sync.json
           {
             echo "drift=$(jq -r .drift out/sync.json)"
             echo "branch=$(jq -r '.branch // empty' out/sync.json)"
             echo "title=$(jq -r '.title // empty' out/sync.json)"
-            echo "table_sha256=$(jq -r .table_sha256 out/sync.json)"
+            echo "sync_sha256=$(jq -r .sync_sha256 out/sync.json)"
             echo "version=$(jq -r .version out/sync.json)"
           } >> "$GITHUB_OUTPUT"
           if [ "$(jq -r .drift out/sync.json)" = "false" ]; then
-            echo "No drift: extracted table equals $(jq -r .matched out/sync.json) in $HAPP_SUB_REPO."
+            echo "No drift: extracted table equals $(jq -r .matched out/sync.json) and the signers equal HAPP_SIGNERS in $HAPP_SUB_REPO."
           fi
 
       - name: Open or update the happ-sub pull request
@@ -238,24 +238,24 @@ jobs:
           GH_TOKEN: ${{ secrets.HAPP_SUB_PR_TOKEN }}
           BRANCH: ${{ steps.sync.outputs.branch }}
           TITLE: ${{ steps.sync.outputs.title }}
-          TABLE_SHA: ${{ steps.sync.outputs.table_sha256 }}
+          SYNC_SHA: ${{ steps.sync.outputs.sync_sha256 }}
           VERSION: ${{ steps.sync.outputs.version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # An open PR that already carries this table (same branch or same table digest) is reused,
-          # so weekly runs and later releases with the same keys comment instead of duplicating it.
+          # An open PR that already carries this change (same branch, or same digest over the table and
+          # the signers) is reused, so weekly runs and later releases comment instead of duplicating it.
           existing=$(gh pr list --repo "$HAPP_SUB_REPO" --state open --limit 100 --json number,headRefName,body \
-            | jq -r --arg b "$BRANCH" --arg m "happ-keys-table-sha256: $TABLE_SHA" \
+            | jq -r --arg b "$BRANCH" --arg m "happ-sub-sync-sha256: $SYNC_SHA" \
               'map(select(.headRefName == $b or (.body | contains($m)))) | .[0].number // empty')
           if [ -n "$existing" ]; then
             gh pr comment "$existing" --repo "$HAPP_SUB_REPO" \
-              --body "Table still observed in Happ $VERSION (digest \`$TABLE_SHA\`): $RUN_URL"
+              --body "Same change still observed in Happ $VERSION (digest \`$SYNC_SHA\`): $RUN_URL"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add src/keys
+          git add src/keys src/device
           git commit -m "$TITLE" -m "Extracted from Happ $VERSION by $RUN_URL"
           git push --force origin "$BRANCH"
           gh pr create --repo "$HAPP_SUB_REPO" --base main --head "$BRANCH" \

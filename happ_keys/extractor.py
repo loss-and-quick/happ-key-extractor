@@ -18,7 +18,7 @@ except ImportError:
 from androguard.core.apk import APK
 from androguard.core.dex import DEX
 
-from happ_keys.apk_signer import get_apk_cert_digest
+from happ_keys.apk_signer import get_apk_cert_digest, get_ssaid_signers, signers_export
 from happ_keys.combine import combine_keys
 from happ_keys.dex_parser import parse_dex_structure
 from happ_keys.native import UnicornNativeDumper
@@ -41,8 +41,14 @@ class ExtractionResult:
     keys: dict[str, str]
     meta: dict[str, Any]
     report: VerificationReport
+    signers: dict[str, Any]
 
-    def save(self, output_keys_path: Path | str | None, meta_path: Path | str | None = None) -> None:
+    def save(
+        self,
+        output_keys_path: Path | str | None,
+        meta_path: Path | str | None = None,
+        signers_path: Path | str | None = None,
+    ) -> None:
         if output_keys_path is not None:
             p = Path(output_keys_path)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -55,6 +61,11 @@ class ExtractionResult:
             mp.parent.mkdir(parents=True, exist_ok=True)
             content = json.dumps(self.meta, indent=2, sort_keys=True)
             mp.write_text(content, encoding="utf-8")
+
+        if signers_path is not None:
+            sp = Path(signers_path)
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            sp.write_text(json.dumps(self.signers, indent=2) + "\n", encoding="utf-8")
 
 
 class Extractor:
@@ -173,4 +184,7 @@ class Extractor:
             checks=checks,
         )
 
-        return ExtractionResult(keys=keys, meta=meta, report=report)
+        scheme, certs = get_ssaid_signers(self.apk)
+        signers = signers_export(scheme, certs, self.version_name)
+
+        return ExtractionResult(keys=keys, meta=meta, report=report, signers=signers)

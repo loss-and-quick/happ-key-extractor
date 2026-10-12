@@ -1,6 +1,6 @@
 # happ-key-extractor
 
-Extracts the 90 AES-128 subscription body keys from the Android client Happ (`su.happ.proxyutility`) and checks them offline. A weekly CI job runs it on the latest Happ release. If the vendor rotates the keys, the job opens a pull request that adds the new table to [happ-sub](https://github.com/loss-and-quick/happ-sub), the Rust crate that decrypts Happ subscriptions.
+Extracts the 90 AES-128 subscription body keys from the Android client Happ (`su.happ.proxyutility`) and checks them offline. A weekly CI job runs it on the latest Happ release. If the vendor rotates the keys or the APK signing certificate, the job opens a pull request against [happ-sub](https://github.com/loss-and-quick/happ-sub), the Rust crate that decrypts Happ subscriptions and computes the SSAID Happ reports as its device id.
 
 Happ is a closed-source fork of the GPL-3.0 client [v2rayNG](https://github.com/2dust/v2rayNG). Its subscription bodies are encrypted with AES-128-GCM under a key picked by the `?key=keyNN` URL parameter. The key table is not in the APK as plain data: the app assembles it at runtime from native code, DEX constants and pixels hidden in icons. This tool rebuilds that assembly without an Android device or emulator.
 
@@ -52,24 +52,33 @@ python -m pip install --require-hashes -r requirements.txt   # or: nix develop
 
 | Command | Purpose |
 | --- | --- |
-| `python -m happ_keys extract Happ.apk -o keys.json --meta meta.json [--report text\|json] [--verify-only]` | Extract the table and run the checks. Exits non-zero if a critical check fails. |
+| `python -m happ_keys extract Happ.apk -o keys.json --meta meta.json [--signers signers.json] [--report text\|json] [--verify-only]` | Extract the table and the signer certificates and run the checks. Exits non-zero if a critical check fails. |
 | `python -m happ_keys verify-url-keys [--fixtures-dir DIR] [--keys FILE]` | Decrypt the captured `happ://crypt5/` fixtures with the pinned RSA keys. |
 | `python -m happ_keys fetch-apks --dest DIR [--version V ...]` | Download the pinned test APKs into `DIR/<version>/<asset>` and verify each sha256. Files already cached and verified are not downloaded again. |
-| `python -m happ_keys happ-sub-sync --keys K --meta M --report R --repo HAPP_SUB [--write] [--pr-body FILE] [--run-url URL]` | Compare an extracted table with every `src/keys/gen*.rs` in a happ-sub checkout. On drift with `--write`, it generates the next generation (see below). |
+| `python -m happ_keys happ-sub-sync --keys K --meta M --report R [--signers S] --repo HAPP_SUB [--write] [--pr-body FILE] [--run-url URL]` | Compare an extracted table with every `src/keys/gen*.rs` and the signers with `src/device/signers.rs` in a happ-sub checkout. On drift with `--write`, it generates the changed sources (see below). |
 | `python -m happ_keys.canary tests/data/crypt5_keys.json` | Live crypt5 canary (network). |
 
 `keys.json` maps each id to its entry (`{"key01": "key01:3jk#R2d&Dd", ...}`), sorted and indented by 2, with no trailing newline.
 
+`signers.json` holds the certificates Android feeds into the SSAID HMAC: those of the highest signature scheme in the APK (v3.1, then v3, v2, v1), the first certificate of each signer, in signer order and never mixed across schemes. It is `{"scheme": "v2", "apk_version": "4.7.1", "certs": [base64 DER, ...], "sha256": [hex, ...]}`. Happ 4.3.0 through 4.7.1 carry one v2 signer, certificate SHA-256 `397e98abed03c5f263ffaf4e8a1043b2a59f538b99e75cf152fa05a7e8007d8d`.
+
 ### Drift handling
 
-`happ-sub-sync` parses the Rust tables in happ-sub, so happ-sub stays the only place the tables are kept. If the extracted table equals an existing generation, there is no drift. Otherwise, with `--write`, it:
+`happ-sub-sync` parses the Rust sources in happ-sub, so happ-sub stays the only place the tables and certificates are kept. If the extracted table equals an existing generation, the keys have not drifted. Otherwise, with `--write`, it:
 
 - writes `src/keys/gen<N+1>.rs` in the same layout as `gen1.rs`;
 - registers it in `src/keys/mod.rs` with `mod`, `pub use` and a `TABLE_GEN<N+1>_<version>` const whose id is `gen<N+1>-<version>`;
 - puts the new table first in `ALL_TABLES`, using rustfmt's layout;
 - leaves `DEFAULT_TABLE` unchanged.
 
-The pull request body lists the APK version and sha256, the check results, the run URL and a table digest. The digest lets later runs find the open PR instead of opening a duplicate.
+The signers have drifted when the scheme or the certificate list differs from `HAPP_SIGNERS` in `src/device/signers.rs`; a newer `apk_version` alone is not drift. With `--write`, it:
+
+- regenerates `signers.rs` in its generated layout, with the new scheme, certificates and `apk_version`;
+- recomputes the certificate-derived pins in the `src/device/mod.rs` tests: scheme, certificate count, length and SHA-256 in `signers_digest_pinned`, and the expected SSAIDs in `ssaid_matches_vector`.
+
+`HAPP_VERSION`, `HAPP_VERSION_CODE` and `HAPP_UA_BUILD_STAMP` in `src/device/mod.rs` do not follow from the signature and stay as they are. If they describe an older release, the PR says so, and `signers_digest_pinned` fails until they are updated by hand.
+
+The pull request body lists the APK version and sha256, the check results, the run URL and a digest over the table and the signers. A signer change adds the section "Signing certificate changed: SSAID values computed by clients change for new installs" with the old and new certificate digests. The digest lets later runs find the open PR instead of opening a duplicate.
 
 ## Tests
 
@@ -96,7 +105,7 @@ A cached file whose sha256 does not match always fails.
 | `data.result.dec` | The decrypted and decompressed `assets/data.result` from Happ 4.7.1. |
 | `crypt5_keys.json` | `crypt5_keys.json` from [KernelEditor/HappDecrypt](https://github.com/KernelEditor/HappDecrypt) at commit `8d0b97b1875446abb16a0d1b62492a404e766860`, unmodified. happ-sub ships the same file as `src/keys/url-keys.json`. |
 | `crypt5/resp-*.json` | Links that crypto.happ.su generated for `https://example.com/...` probe URLs. |
-| `happ-sub/gen1.rs`, `happ-sub/mod.rs` | Snapshots of happ-sub's `src/keys/` sources, used by the generator tests. |
+| `happ-sub/src/keys/{gen1,mod}.rs`, `happ-sub/src/device/{signers,mod}.rs` | Snapshots of happ-sub's `src/keys/` and `src/device/` sources, used by the generator tests. |
 
 ## CI
 
@@ -105,8 +114,8 @@ A cached file whose sha256 does not match always fails.
 | Job | Runs on | What it does |
 | --- | --- | --- |
 | `lint-test` | all events | Ruff check and format check. Restores the pinned APKs from `actions/cache` (keyed on the hash of `tests/apks.json`), fetches any that are missing, then runs pytest with `HAPP_REQUIRE_APKS=1`. |
-| `extract` | all events | Downloads the latest Happ release and checks it against the asset digest GitHub reports. Extracts and verifies, then uploads the result as an artifact. Outside pull requests, a failed extraction opens or comments on one tracking issue, and the next success closes it. |
-| `happ-sub-sync` | not on pull requests | Checks out `loss-and-quick/happ-sub` and runs `happ-sub-sync`. On drift it pushes `keys/gen<N+1>-<version>` and opens a PR. If an open PR already has that branch or that table digest, the job comments on it instead. |
+| `extract` | all events | Downloads the latest Happ release and checks it against the asset digest GitHub reports. Extracts and verifies, then uploads `keys.json`, `meta.json`, `signers.json` and the report as an artifact. Outside pull requests, a failed extraction opens or comments on one tracking issue, and the next success closes it. |
+| `happ-sub-sync` | not on pull requests | Checks out `loss-and-quick/happ-sub` and runs `happ-sub-sync` on the key table and the signers. On drift it commits `src/keys` and `src/device`, pushes `keys/gen<N+1>-<version>` (or `signers/<version>` when only the certificate changed) and opens a PR. If an open PR already has that branch or that digest, the job comments on it instead. |
 | `crypt5-canary` | schedule, dispatch | Generates a link through crypto.happ.su and decrypts it with `tests/data/crypt5_keys.json`. If the generator cannot be reached, the job logs a warning and passes. A decryption failure opens or comments on a tracking issue, and only a verified decryption closes it. |
 
 The workflow pushes nothing to this repository. All jobs have `contents: read`; `extract` and `crypt5-canary` also have `issues: write`. Actions are pinned by commit SHA.
