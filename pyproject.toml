@@ -6,6 +6,7 @@ license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
   "androguard>=4.1",
+  "faker>=37",
   "cryptography>=42",
   "pillow>=10",
   "pycryptodome>=3.20",

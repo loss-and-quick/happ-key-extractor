@@ -1,8 +1,8 @@
 """Weekly crypt5 live rotation canary.
 
 Generates a fresh happ://crypt5/ link via the public generator API (crypto.happ.su)
-for a neutral target URL, and verifies that the pinned keyring decrypts it.
-Runs strictly once per workflow invocation without aggressive retries.
+for a random plausible-looking target URL, and verifies that the pinned keyring
+decrypts it. Runs strictly once per workflow invocation without aggressive retries.
 """
 
 import json
@@ -12,6 +12,8 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+
+from faker import Faker
 
 from happ_keys.crypt5_verifier import _swap_block_halves, decrypt_crypt5_link
 
@@ -28,6 +30,19 @@ BROWSER_USER_AGENTS: list[str] = [
 ]
 
 
+_faker = Faker()
+
+
+def random_plausible_url() -> str:
+    """Return a random realistic-looking target URL, e.g. https://www.rice-hughes.com/news/rooms/canary-a1b2c3d4e5f6."""
+    probe_id = uuid.uuid4().hex[:12]
+    host = _faker.domain_name()
+    if random.random() < 0.5:
+        host = f"www.{host}"
+    path = "/".join(_faker.slug() for _ in range(random.randint(1, 3)))
+    return f"https://{host}/{path}/canary-{probe_id}"
+
+
 def run_crypt5_canary(keys_path: Path | str) -> int:
     keys_file = Path(keys_path)
     if not keys_file.is_file():
@@ -37,9 +52,8 @@ def run_crypt5_canary(keys_path: Path | str) -> int:
     with open(keys_file, encoding="utf-8") as f:
         keyring = json.load(f)
 
-    # 1. Prepare neutral probe URL
-    probe_id = uuid.uuid4().hex[:12]
-    target_url = f"https://example.com/sub/canary-{probe_id}"
+    # 1. Prepare a random plausible probe URL
+    target_url = random_plausible_url()
     user_agent = random.choice(BROWSER_USER_AGENTS)
 
     print(f"Target URL:  {target_url}")
