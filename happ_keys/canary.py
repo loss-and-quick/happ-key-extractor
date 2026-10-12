@@ -19,15 +19,7 @@ from happ_keys.crypt5_verifier import _swap_block_halves, decrypt_crypt5_link
 
 GENERATOR_API_URL: str = "https://crypto.happ.su/api-v2.php"
 
-BROWSER_USER_AGENTS: list[str] = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
-    "Version/18.0 Safari/605.1.15",
-]
+_faker = Faker()
 
 
 _faker = Faker()
@@ -52,9 +44,9 @@ def run_crypt5_canary(keys_path: Path | str) -> int:
     with open(keys_file, encoding="utf-8") as f:
         keyring = json.load(f)
 
-    # 1. Prepare a random plausible probe URL
+    # 1. Prepare a random plausible probe URL and user agent
     target_url = random_plausible_url()
-    user_agent = random.choice(BROWSER_USER_AGENTS)
+    user_agent = _faker.user_agent()
 
     print(f"Target URL:  {target_url}")
     print(f"User-Agent:  {user_agent}")
