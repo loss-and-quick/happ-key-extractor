@@ -158,7 +158,10 @@ def run_happ_sub_sync(args: argparse.Namespace) -> int:
         signers = None
         if args.signers:
             signers = happ_sub.signers_from_json(json.loads(Path(args.signers).read_text(encoding="utf-8")))
-        plan = happ_sub.plan_sync(repo, entries, str(meta["app_version"]), signers)
+        # A null stamp means the User-Agent builder was not found; release.rs is then left alone.
+        release_unknown = meta.get("ua_build_stamp") is None
+        release = None if release_unknown else happ_sub.release_from_meta(meta)
+        plan = happ_sub.plan_sync(repo, entries, str(meta["app_version"]), signers, release, release_unknown)
         written = happ_sub.apply_sync(repo, plan, entries) if args.write else []
     except happ_sub.HappSubFormatError as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -1,6 +1,6 @@
 # happ-key-extractor
 
-Extracts the 90 AES-128 subscription body keys from the Android client Happ (`su.happ.proxyutility`) and checks them offline. A weekly CI job runs it on the latest Happ release. If the vendor rotates the keys or the APK signing certificate, the job opens a pull request against [happ-sub](https://github.com/loss-and-quick/happ-sub), the Rust crate that decrypts Happ subscriptions and computes the SSAID Happ reports as its device id.
+Extracts the 90 AES-128 subscription body keys from the Android client Happ (`su.happ.proxyutility`) and checks them offline. A weekly CI job runs it on the latest Happ release. If the vendor rotates the keys or the APK signing certificate, or ships a new version, the job opens a pull request against [happ-sub](https://github.com/loss-and-quick/happ-sub), the Rust crate that decrypts Happ subscriptions and computes the SSAID Happ reports as its device id.
 
 Happ is a closed-source fork of the GPL-3.0 client [v2rayNG](https://github.com/2dust/v2rayNG). Its subscription bodies are encrypted with AES-128-GCM under a key picked by the `?key=keyNN` URL parameter. The key table is not in the APK as plain data: the app assembles it at runtime from native code, DEX constants and pixels hidden in icons. This tool rebuilds that assembly without an Android device or emulator.
 
@@ -30,7 +30,7 @@ entry[i] = AES-128-GCM-decrypt(ct = S(list1[i]), key = S(list2[i]), tag = S(list
 
 ### Verification checks
 
-`extract` runs five offline checks. The first four are critical. The fifth only raises a warning, because a rotation is expected to change it.
+`extract` runs six offline checks. The first four are critical. The last two only raise warnings: a rotation is expected to change the doc anchor, and a missing User-Agent builder must not block key and signer sync.
 
 | Check | What it proves |
 | --- | --- |
@@ -39,6 +39,7 @@ entry[i] = AES-128-GCM-decrypt(ct = S(list1[i]), key = S(list2[i]), tag = S(list
 | `domain_registry_asset` | Decrypts `assets/data.result` with key `S(35) + literal` and IV `S(1059)`, both from the emulated native code. The output must be zstd-compressed JSON with a non-empty group map (390 groups in 4.7.1). This shows the emulator returns correct strings. |
 | `steganography_payloads` | All 90 icons decode with the `!encoded!` magic. |
 | `upstream_doc_anchor` | `key02` equals `key02:+]%4ij#P"/`, the test key in the vendor's provider documentation (warning only). |
+| `user_agent_builder` | The method holding the `"Happ/<versionName>/"` literal yields the User-Agent build stamp and suffix (warning only). If it fails, `meta.json` records them as `null`, CI opens or comments on the issue "Happ UA builder not found", and `happ-sub-sync` leaves `release.rs` alone. |
 
 Supported releases are 4.3.0 through 4.7.1, which share one table, gen1 in happ-sub. 3.26.3 and older use a different JNI epilogue and a 10-key table. The extractor rejects them with `UnsupportedCodeShapeError`.
 
@@ -60,6 +61,8 @@ python -m pip install --require-hashes -r requirements.txt   # or: nix develop
 
 `keys.json` maps each id to its entry (`{"key01": "key01:3jk#R2d&Dd", ...}`), sorted and indented by 2, with no trailing newline.
 
+`meta.json` also records the User-Agent release constants: `ua_build_stamp` and `ua_suffix`. Happ sends `Happ/<versionName>/<os>/<stamp><versionCode><parity><suffix>`, where `stamp` is a millisecond timestamp baked in at build time, `parity` is `6` on even and `5` on odd UTC days, and `suffix` is a two-digit literal that changes between releases (`50` in 4.7.1, `35` in 4.5.0, `38` in 4.3.0). The builder is found by its `"Happ/<versionName>/"` literal, not by class name, and its version is cross-checked against the manifest.
+
 `signers.json` holds the certificates Android feeds into the SSAID HMAC: those of the highest signature scheme in the APK (v3.1, then v3, v2, v1), the first certificate of each signer, in signer order and never mixed across schemes. It is `{"scheme": "v2", "apk_version": "4.7.1", "certs": [base64 DER, ...], "sha256": [hex, ...]}`. Happ 4.3.0 through 4.7.1 carry one v2 signer, certificate SHA-256 `397e98abed03c5f263ffaf4e8a1043b2a59f538b99e75cf152fa05a7e8007d8d`.
 
 ### Drift handling
@@ -76,9 +79,9 @@ The signers have drifted when the scheme or the certificate list differs from `H
 - regenerates `signers.rs` in its generated layout, with the new scheme, certificates and `apk_version`;
 - recomputes the certificate-derived pins in the `src/device/mod.rs` tests: scheme, certificate count, length and SHA-256 in `signers_digest_pinned`, and the expected SSAIDs in `ssaid_matches_vector`.
 
-`HAPP_VERSION`, `HAPP_VERSION_CODE` and `HAPP_UA_BUILD_STAMP` in `src/device/mod.rs` do not follow from the signature and stay as they are. If they describe an older release, the PR says so, and `signers_digest_pinned` fails until they are updated by hand.
+The release constants `HAPP_VERSION`, `HAPP_VERSION_CODE`, `HAPP_UA_BUILD_STAMP` and `HAPP_UA_SUFFIX` in `src/release.rs` have drifted when any of them differs from the APK. With `--write`, it rewrites their values in place and leaves the doc comments alone, so those must not name a version. It also regenerates `signers.rs` with the new `apk_version`, which `signers_digest_pinned` checks against `HAPP_VERSION`. A version-only change opens a PR on `release/<version>` with the section "Happ version updated". When the stamp is unknown, `release.rs` is skipped entirely, because a new version with the old stamp and suffix would be a User-Agent no Happ release sends. The PR body says so.
 
-The pull request body lists the APK version and sha256, the check results, the run URL and a digest over the table and the signers. A signer change adds the section "Signing certificate changed: SSAID values computed by clients change for new installs" with the old and new certificate digests. The digest lets later runs find the open PR instead of opening a duplicate.
+The pull request body lists the APK version and sha256, the check results, the run URL and a digest over the table, the signers and the release constants. A signer change adds the section "Signing certificate changed: SSAID values computed by clients change for new installs" with the old and new certificate digests. The digest lets later runs find the open PR instead of opening a duplicate.
 
 ## Tests
 
@@ -105,7 +108,7 @@ A cached file whose sha256 does not match always fails.
 | `data.result.dec` | The decrypted and decompressed `assets/data.result` from Happ 4.7.1. |
 | `crypt5_keys.json` | `crypt5_keys.json` from [KernelEditor/HappDecrypt](https://github.com/KernelEditor/HappDecrypt) at commit `8d0b97b1875446abb16a0d1b62492a404e766860`, unmodified. happ-sub ships the same file as `src/keys/url-keys.json`. |
 | `crypt5/resp-*.json` | Links that crypto.happ.su generated for `https://example.com/...` probe URLs. |
-| `happ-sub/src/keys/{gen1,mod}.rs`, `happ-sub/src/device/{signers,mod}.rs` | Snapshots of happ-sub's `src/keys/` and `src/device/` sources, used by the generator tests. |
+| `happ-sub/src/keys/{gen1,mod}.rs`, `happ-sub/src/device/{signers,mod}.rs`, `happ-sub/src/release.rs` | Snapshots of happ-sub's `src/keys/`, `src/device/` and `src/release.rs` sources, used by the generator tests. |
 
 ## CI
 
@@ -115,7 +118,7 @@ A cached file whose sha256 does not match always fails.
 | --- | --- | --- |
 | `lint-test` | all events | Ruff check and format check. Restores the pinned APKs from `actions/cache` (keyed on the hash of `tests/apks.json`), fetches any that are missing, then runs pytest with `HAPP_REQUIRE_APKS=1`. |
 | `extract` | all events | Downloads the latest Happ release and checks it against the asset digest GitHub reports. Extracts and verifies, then uploads `keys.json`, `meta.json`, `signers.json` and the report as an artifact. Outside pull requests, a failed extraction opens or comments on one tracking issue, and the next success closes it. |
-| `happ-sub-sync` | not on pull requests | Checks out `loss-and-quick/happ-sub` and runs `happ-sub-sync` on the key table and the signers. On drift it commits `src/keys` and `src/device`, pushes `keys/gen<N+1>-<version>` (or `signers/<version>` when only the certificate changed) and opens a PR. If an open PR already has that branch or that digest, the job comments on it instead. |
+| `happ-sub-sync` | not on pull requests | Checks out `loss-and-quick/happ-sub` and runs `happ-sub-sync` on the key table, the signers and the release constants. On drift it commits `src/keys`, `src/device` and `src/release.rs`, pushes `keys/gen<N+1>-<version>` (or `signers/<version>` or `release/<version>` when the keys are unchanged) and opens a PR. If an open PR already has that branch or that digest, the job comments on it instead. |
 | `crypt5-canary` | schedule, dispatch | Generates a link through crypto.happ.su and decrypts it with `tests/data/crypt5_keys.json`. If the generator cannot be reached, the job logs a warning and passes. A decryption failure opens or comments on a tracking issue, and only a verified decryption closes it. |
 
 The workflow pushes nothing to this repository. All jobs have `contents: read`; `extract` and `crypt5-canary` also have `issues: write`. Actions are pinned by commit SHA.

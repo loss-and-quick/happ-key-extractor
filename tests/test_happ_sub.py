@@ -18,6 +18,9 @@ GEN1_RS = (SNAPSHOT_DIR / "src" / "keys" / "gen1.rs").read_text(encoding="utf-8"
 MOD_RS = (SNAPSHOT_DIR / "src" / "keys" / "mod.rs").read_text(encoding="utf-8")
 SIGNERS_RS = (SNAPSHOT_DIR / "src" / "device" / "signers.rs").read_text(encoding="utf-8")
 DEVICE_MOD_RS = (SNAPSHOT_DIR / "src" / "device" / "mod.rs").read_text(encoding="utf-8")
+RELEASE_RS = (SNAPSHOT_DIR / "src" / "release.rs").read_text(encoding="utf-8")
+HAPP_471 = happ_sub.Release(version="4.7.1", version_code=1703, ua_build_stamp="1791210317680", ua_suffix="50")
+HAPP_480 = happ_sub.Release(version="4.8.0", version_code=1720, ua_build_stamp="1792000000000", ua_suffix="41")
 HAPP_CERT_SHA256 = "397e98abed03c5f263ffaf4e8a1043b2a59f538b99e75cf152fa05a7e8007d8d"
 # Not a certificate: happ-sub treats signer certificates as opaque bytes.
 FAKE_CERT = bytes((i * 37 + 11) % 256 for i in range(700))
@@ -447,7 +450,7 @@ def test_cli_sync_signer_drift_pr_body(happ_sub_repo: Path, tmp_path: Path, caps
     assert "## Signing certificate changed: SSAID values computed by clients change for new installs" in body
     assert f"`{HAPP_CERT_SHA256}` (Happ 4.7.1)" in body
     assert f"`{hashlib.sha256(FAKE_CERT).hexdigest()}` (Happ 4.8.0)" in body
-    assert "`HAPP_VERSION` in `src/device/mod.rs` is still 4.7.1" in body
+    assert "`HAPP_VERSION` is still 4.7.1" in body
     assert "Keys that differ" not in body
     assert f"<!-- happ-sub-sync-sha256: {result['sync_sha256']} -->" in body
 
@@ -457,3 +460,156 @@ def test_cli_sync_refuses_failed_extraction(happ_sub_repo: Path, tmp_path: Path)
     assert main(["happ-sub-sync", *args, "--repo", str(happ_sub_repo), "--write"]) == 1
     assert not (happ_sub_repo / "src" / "keys" / "gen2.rs").exists()
     assert (happ_sub_repo / "src" / "device" / "signers.rs").read_text(encoding="utf-8") == SIGNERS_RS
+
+
+def test_release_roundtrip() -> None:
+    assert happ_sub.parse_release_rs(RELEASE_RS) == HAPP_471
+    assert happ_sub.update_release_rs(RELEASE_RS, HAPP_471) == RELEASE_RS
+
+
+def test_update_release_rs_rewrites_values_only() -> None:
+    expected = (
+        RELEASE_RS.replace('"4.7.1"', '"4.8.0"')
+        .replace("= 1703;", "= 1720;")
+        .replace('"1791210317680"', '"1792000000000"')
+        .replace('"50"', '"41"')
+    )
+    assert happ_sub.update_release_rs(RELEASE_RS, HAPP_480) == expected
+    assert happ_sub.parse_release_rs(expected) == HAPP_480
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (lambda s: s + 'pub const HAPP_UA_SUFFIX: &str = "51";\n', "expected one `pub const HAPP_UA_SUFFIX"),
+        (lambda s: s.replace('= "50";', "= SUFFIX;"), "HAPP_UA_SUFFIX is not a plain string literal"),
+        (lambda s: s.replace("= 1703;", "= 0x6a7;"), "HAPP_VERSION_CODE is not a decimal literal"),
+        (lambda s: s.replace("pub const HAPP_VERSION: &str", "pub const VERSION: &str"), "found 0"),
+    ],
+)
+def test_release_parser_rejects_unexpected_input(edit: Callable[[str], str], message: str) -> None:
+    with pytest.raises(happ_sub.HappSubFormatError, match=message):
+        happ_sub.parse_release_rs(edit(RELEASE_RS))
+
+
+def test_release_from_meta_validates() -> None:
+    meta = {"app_version": "4.8.0", "versionCode": 1720, "ua_build_stamp": "1792000000000", "ua_suffix": "41"}
+    assert happ_sub.release_from_meta(meta) == HAPP_480
+    for bad, message in [
+        ({"ua_suffix": None} | {k: v for k, v in meta.items() if k != "ua_suffix"}, "decimal digits"),
+        ({k: v for k, v in meta.items() if k != "ua_build_stamp"}, "lacks the release constants"),
+        (meta | {"app_version": "4.8.0; rm"}, "refusing"),
+        (meta | {"versionCode": 2**32}, "u32"),
+    ]:
+        with pytest.raises(happ_sub.HappSubFormatError, match=message):
+            happ_sub.release_from_meta(bad)
+
+
+def test_same_release_is_not_drift(happ_sub_repo: Path) -> None:
+    entries = happ_sub.table_from_keys_json(_reference_keys())
+    plan = happ_sub.plan_sync(happ_sub_repo, entries, "4.7.1", _happ_signers(), HAPP_471)
+
+    assert plan.drift is False
+    assert happ_sub.apply_sync(happ_sub_repo, plan, entries) == []
+
+
+def test_release_drift_bumps_release_and_signer_version(happ_sub_repo: Path) -> None:
+    entries = happ_sub.table_from_keys_json(_reference_keys())
+
+    plan = happ_sub.plan_sync(happ_sub_repo, entries, "4.8.0", _happ_signers("4.8.0"), HAPP_480)
+    assert plan.drift is True
+    assert (plan.keys_drift, plan.signers_drift, plan.release_drift) == (False, False, True)
+    assert plan.branch == "release/4.8.0"
+    assert plan.title == "feat(device): update the release constants from Happ 4.8.0"
+    assert plan.previous_release == HAPP_471
+
+    written = happ_sub.apply_sync(happ_sub_repo, plan, entries)
+    assert [str(p.relative_to(happ_sub_repo)) for p in written] == ["src/device/signers.rs", "src/release.rs"]
+    assert happ_sub.load_release(happ_sub_repo) == HAPP_480
+    # Same certificates, so the cert-derived pins and mod.rs stay; only the recorded version moves.
+    assert happ_sub.load_signers(happ_sub_repo) == _happ_signers("4.8.0")
+    assert (happ_sub_repo / "src" / "device" / "mod.rs").read_text(encoding="utf-8") == DEVICE_MOD_RS
+
+    assert happ_sub.plan_sync(happ_sub_repo, entries, "4.8.0", _happ_signers("4.8.0"), HAPP_480).drift is False
+
+
+def test_all_three_drift_in_one_change(happ_sub_repo: Path) -> None:
+    entries = happ_sub.table_from_keys_json(_rotated_keys())
+    fake = happ_sub.Signers(scheme="v2", certs=(FAKE_CERT,), apk_version="4.8.0")
+
+    plan = happ_sub.plan_sync(happ_sub_repo, entries, "4.8.0", fake, HAPP_480)
+    assert plan.branch == "keys/gen2-4.8.0"
+    assert plan.title == (
+        "feat(keys): add generation 2 body keys, the signing certificate and the release constants from Happ 4.8.0"
+    )
+    assert plan.device_happ_version is None
+
+    written = happ_sub.apply_sync(happ_sub_repo, plan, entries)
+    assert [str(p.relative_to(happ_sub_repo)) for p in written] == [
+        "src/keys/gen2.rs",
+        "src/keys/mod.rs",
+        "src/device/signers.rs",
+        "src/device/mod.rs",
+        "src/release.rs",
+    ]
+
+
+def test_sync_digest_covers_release(happ_sub_repo: Path) -> None:
+    entries = happ_sub.table_from_keys_json(_reference_keys())
+    old = happ_sub.plan_sync(happ_sub_repo, entries, "4.7.1", _happ_signers(), HAPP_471)
+    new = happ_sub.plan_sync(happ_sub_repo, entries, "4.8.0", _happ_signers(), HAPP_480)
+
+    assert old.table_sha256 == new.table_sha256
+    assert old.signers_sha256 == new.signers_sha256
+    assert old.sync_sha256 != new.sync_sha256
+
+
+def test_cli_sync_release_drift_pr_body(
+    happ_sub_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _write_extraction(tmp_path, _reference_keys(), list(_happ_signers().certs))
+    meta_path = tmp_path / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta |= {"versionCode": 1720, "ua_build_stamp": "1792000000000", "ua_suffix": "41"}
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    pr_body = tmp_path / "pr.md"
+
+    result = _run_sync(happ_sub_repo, args, pr_body, capsys)
+
+    assert (result["keys_drift"], result["signers_drift"], result["release_drift"]) == (False, False, True)
+    assert result["branch"] == "release/4.8.0"
+    assert result["written"] == ["src/device/signers.rs", "src/release.rs"]
+    body = pr_body.read_text(encoding="utf-8")
+    assert "## Happ version updated" in body
+    assert "- Before: Happ 4.7.1, versionCode 1703, User-Agent build stamp `1791210317680`, suffix `50`" in body
+    assert "- After: Happ 4.8.0, versionCode 1720, User-Agent build stamp `1792000000000`, suffix `41`" in body
+    assert "`HAPP_SIGNERS.apk_version` follows" in body
+    assert happ_sub.SIGNERS_SECTION not in body
+    assert f"<!-- happ-sub-sync-sha256: {result['sync_sha256']} -->" in body
+
+
+def test_missing_release_rs_is_a_format_error(happ_sub_repo: Path) -> None:
+    (happ_sub_repo / "src" / "release.rs").unlink()
+    entries = happ_sub.table_from_keys_json(_reference_keys())
+    with pytest.raises(happ_sub.HappSubFormatError, match=r"release\.rs not found"):
+        happ_sub.plan_sync(happ_sub_repo, entries, "4.7.1", _happ_signers(), HAPP_471)
+
+
+def test_cli_sync_unknown_release_still_syncs_signers(
+    happ_sub_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _write_extraction(tmp_path, _reference_keys(), [FAKE_CERT])
+    meta_path = tmp_path / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) | {"ua_build_stamp": None, "ua_suffix": None}
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    pr_body = tmp_path / "pr.md"
+
+    result = _run_sync(happ_sub_repo, args, pr_body, capsys)
+
+    assert (result["signers_drift"], result["release_drift"], result["release_unknown"]) == (True, False, True)
+    assert result["written"] == ["src/device/signers.rs", "src/device/mod.rs"]
+    assert (happ_sub_repo / "src" / "release.rs").read_text(encoding="utf-8") == RELEASE_RS
+    body = pr_body.read_text(encoding="utf-8")
+    assert f"## {happ_sub.RELEASE_UNKNOWN_SECTION}" in body
+    assert "## Happ version updated" not in body
+    assert "`HAPP_VERSION` is still 4.7.1" in body

@@ -270,7 +270,6 @@ _CERT_CONST_RE = re.compile(
     r"const\s+(?P<name>CERT_\d+)\s*:\s*\[\s*u8\s*;\s*(?P<len>\d+)\s*\]\s*=\s*\[(?P<body>[^\]]*)\]\s*;"
 )
 _BYTE_TOKEN_RE = re.compile(r"^(?:0x[0-9a-fA-F]{1,2}|[0-9]{1,3})(?:u8)?$")
-_HAPP_VERSION_RE = re.compile(r'^pub const HAPP_VERSION: &str = "(?P<version>[^"\\]*)";$', re.M)
 
 
 @dataclass(frozen=True)
@@ -486,9 +485,113 @@ def load_signers(repo: Path) -> Signers:
     return parse_signers_rs((repo / DEVICE_DIR / "signers.rs").read_text(encoding="utf-8"))
 
 
+# Release constants happ-sub's User-Agent and request code identify as, one `pub const` per line.
+RELEASE_RS = Path("src") / "release.rs"
+_RELEASE_CONST_RE = r"^(?P<head>pub const {name}: {ty} = )(?P<value>[^;\n]*)(?P<tail>;)$"
+_STR_VALUE_RE = re.compile(r'^"(?P<s>[^"\\]*)"$')
+_DIGITS_RE = re.compile(r"^[0-9]+$")
+_RELEASE_FIELDS = (
+    ("HAPP_VERSION", "&str"),
+    ("HAPP_VERSION_CODE", "u32"),
+    ("HAPP_UA_BUILD_STAMP", "&str"),
+    ("HAPP_UA_SUFFIX", "&str"),
+)
+
+
+@dataclass(frozen=True)
+class Release:
+    """What Happ's User-Agent carries for one APK: version, versionCode, build stamp and suffix."""
+
+    version: str
+    version_code: int
+    ua_build_stamp: str
+    ua_suffix: str
+
+    def rust_values(self) -> dict[tuple[str, str], str]:
+        values = (f'"{self.version}"', str(self.version_code), f'"{self.ua_build_stamp}"', f'"{self.ua_suffix}"')
+        return dict(zip(_RELEASE_FIELDS, values, strict=True))
+
+
+def _check_release(release: Release) -> None:
+    _check_version(release.version)
+    if not 0 < release.version_code < 2**32:
+        raise HappSubFormatError(f"versionCode {release.version_code} does not fit in u32")
+    if not (_DIGITS_RE.match(release.ua_build_stamp) and _DIGITS_RE.match(release.ua_suffix)):
+        raise HappSubFormatError("User-Agent build stamp and suffix must be decimal digits")
+
+
+def release_from_meta(meta: Mapping[str, Any]) -> Release:
+    """Read the release constants `extract --meta` records from the manifest and the UA builder."""
+    try:
+        release = Release(
+            version=str(meta["app_version"]),
+            version_code=int(meta["versionCode"]),
+            ua_build_stamp=str(meta["ua_build_stamp"]),
+            ua_suffix=str(meta["ua_suffix"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HappSubFormatError(f"meta.json lacks the release constants: {exc}") from exc
+    _check_release(release)
+    return release
+
+
+def _release_const(source: str, name: str, ty: str) -> re.Match[str]:
+    matches = list(re.finditer(_RELEASE_CONST_RE.format(name=name, ty=re.escape(ty)), source, re.M))
+    if len(matches) != 1:
+        raise HappSubFormatError(f"release.rs: expected one `pub const {name}: {ty}`, found {len(matches)}")
+    return matches[0]
+
+
+def parse_release_rs(source: str) -> Release:
+    """Parse the four release constants from `release.rs`."""
+    values: dict[str, str] = {}
+    for name, ty in _RELEASE_FIELDS:
+        raw = _release_const(source, name, ty)["value"]
+        if ty == "&str":
+            m = _STR_VALUE_RE.match(raw)
+            if m is None:
+                raise HappSubFormatError(f"release.rs: {name} is not a plain string literal")
+            values[name] = m["s"]
+        else:
+            if not _DIGITS_RE.match(raw):
+                raise HappSubFormatError(f"release.rs: {name} is not a decimal literal")
+            values[name] = raw
+    return Release(
+        version=values["HAPP_VERSION"],
+        version_code=int(values["HAPP_VERSION_CODE"]),
+        ua_build_stamp=values["HAPP_UA_BUILD_STAMP"],
+        ua_suffix=values["HAPP_UA_SUFFIX"],
+    )
+
+
+def update_release_rs(source: str, release: Release) -> str:
+    """Rewrite the values of the release constants; comments and layout stay as they are."""
+    _check_release(release)
+    text = source
+    for (name, ty), value in release.rust_values().items():
+        m = _release_const(text, name, ty)
+        text = text[: m.start("value")] + value + text[m.end("value") :]
+    return text
+
+
+def release_sha256(release: Release) -> str:
+    canonical = f"{release.version}\n{release.version_code}\n{release.ua_build_stamp}\n{release.ua_suffix}\n"
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def load_release(repo: Path) -> Release:
+    path = repo / RELEASE_RS
+    if not path.exists():
+        raise HappSubFormatError(f"{RELEASE_RS.as_posix()} not found; happ-sub predates generated release constants")
+    return parse_release_rs(path.read_text(encoding="utf-8"))
+
+
 def device_happ_version(repo: Path) -> str | None:
-    m = _HAPP_VERSION_RE.search((repo / DEVICE_DIR / "mod.rs").read_text(encoding="utf-8"))
-    return m["version"] if m else None
+    return load_release(repo).version if (repo / RELEASE_RS).exists() else None
+
+
+def _join_words(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
 @dataclass(frozen=True)
@@ -508,22 +611,44 @@ class SyncPlan:
     signers: Signers | None = None
     previous_signers: Signers | None = None
     device_happ_version: str | None = None
+    release_drift: bool = False
+    release_sha256: str | None = None
+    release: Release | None = None
+    previous_release: Release | None = None
+    release_unknown: bool = False
 
     @property
     def sync_sha256(self) -> str:
         """Digest of everything a sync PR carries; later runs find an open PR by it."""
-        if self.signers_sha256 is None:
+        parts = [self.table_sha256]
+        if self.signers_sha256 is not None:
+            parts.append(self.signers_sha256)
+        if self.release_sha256 is not None:
+            parts.append(f"release:{self.release_sha256}")
+        if len(parts) == 1:
             return self.table_sha256
-        combined = f"{self.table_sha256}\n{self.signers_sha256}\n"
+        combined = "".join(f"{p}\n" for p in parts)
         return hashlib.sha256(combined.encode("ascii")).hexdigest()
+
+    @property
+    def rewrite_signers(self) -> bool:
+        """signers.rs is regenerated on a new certificate, and on a new release to follow its version."""
+        if self.signers is None or self.previous_signers is None:
+            return False
+        return self.signers_drift or (
+            self.release_drift and self.previous_signers.apk_version != self.signers.apk_version
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "drift": self.drift,
             "keys_drift": self.keys_drift,
             "signers_drift": self.signers_drift,
+            "release_drift": self.release_drift,
+            "release_unknown": self.release_unknown,
             "table_sha256": self.table_sha256,
             "signers_sha256": self.signers_sha256,
+            "release_sha256": self.release_sha256,
             "sync_sha256": self.sync_sha256,
             "version": self.version,
             "matched": self.matched,
@@ -535,8 +660,15 @@ class SyncPlan:
         }
 
 
-def plan_sync(repo: Path, entries: KeyTableEntries, version: str, signers: Signers | None = None) -> SyncPlan:
-    """Compare an extracted table (and, if given, signer set) with a happ-sub checkout."""
+def plan_sync(
+    repo: Path,
+    entries: KeyTableEntries,
+    version: str,
+    signers: Signers | None = None,
+    release: Release | None = None,
+    release_unknown: bool = False,
+) -> SyncPlan:
+    """Compare an extracted table, and if given the signer set and release constants, with happ-sub."""
     tables = load_tables(repo)
     digest = table_sha256(entries)
     match = find_matching_table(entries, tables)
@@ -547,48 +679,51 @@ def plan_sync(repo: Path, entries: KeyTableEntries, version: str, signers: Signe
         and previous_signers is not None
         and (signers.scheme, signers.certs) != (previous_signers.scheme, previous_signers.certs)
     )
-    signer_fields: dict[str, Any] = {
+    previous_release = load_release(repo) if release is not None else None
+    release_drift = release is not None and release != previous_release
+    fields: dict[str, Any] = {
         "signers_drift": signers_drift,
         "signers_sha256": signers_sha256(signers) if signers is not None else None,
         "signers": signers,
         "previous_signers": previous_signers,
-        "device_happ_version": device_happ_version(repo) if signers_drift else None,
+        # Only a release left unsynced can leave HAPP_VERSION behind the new signers.
+        "device_happ_version": device_happ_version(repo) if signers_drift and release is None else None,
+        "release_drift": release_drift,
+        "release_sha256": release_sha256(release) if release is not None else None,
+        "release": release,
+        "previous_release": previous_release,
+        "release_unknown": release_unknown,
     }
 
-    if match is not None:
-        if not signers_drift:
-            return SyncPlan(
-                drift=False, table_sha256=digest, version=version, matched=f"gen{match.generation}", **signer_fields
-            )
-        return SyncPlan(
-            drift=True,
-            table_sha256=digest,
-            version=version,
-            matched=f"gen{match.generation}",
-            branch=f"signers/{version}",
-            title=f"feat(device): update the signing certificate from Happ {version}",
-            **signer_fields,
-        )
-
-    newest = tables[-1]
-    generation = newest.generation + 1
-    previous = newest.as_dict()
-    changed = tuple(kid for kid, key in entries if previous.get(kid) != key)
-    title = f"feat(keys): add generation {generation} body keys from Happ {version}"
+    generation: int | None = None
+    items: list[str] = []
+    if match is None:
+        newest = tables[-1]
+        generation = newest.generation + 1
+        previous = newest.as_dict()
+        fields |= {
+            "matched": None,
+            "generation": generation,
+            "changed_ids": tuple(kid for kid, key in entries if previous.get(kid) != key),
+            "previous_generation": newest.generation,
+            "keys_drift": True,
+        }
+        items.append(f"generation {generation} body keys")
+    else:
+        fields["matched"] = f"gen{match.generation}"
     if signers_drift:
-        title = f"feat(keys): add generation {generation} body keys and the signing certificate from Happ {version}"
-    return SyncPlan(
-        drift=True,
-        table_sha256=digest,
-        version=version,
-        generation=generation,
-        branch=f"keys/gen{generation}-{version}",
-        title=title,
-        changed_ids=changed,
-        previous_generation=newest.generation,
-        keys_drift=True,
-        **signer_fields,
-    )
+        items.append("the signing certificate")
+    if release_drift:
+        items.append("the release constants")
+
+    if not items:
+        return SyncPlan(drift=False, table_sha256=digest, version=version, **fields)
+    if generation is not None:
+        branch, title = f"keys/gen{generation}-{version}", f"feat(keys): add {_join_words(items)} from Happ {version}"
+    else:
+        kind = "signers" if signers_drift else "release"
+        branch, title = f"{kind}/{version}", f"feat(device): update {_join_words(items)} from Happ {version}"
+    return SyncPlan(drift=True, table_sha256=digest, version=version, branch=branch, title=title, **fields)
 
 
 def apply_sync(repo: Path, plan: SyncPlan, entries: KeyTableEntries) -> list[Path]:
@@ -602,13 +737,14 @@ def apply_sync(repo: Path, plan: SyncPlan, entries: KeyTableEntries) -> list[Pat
         mod_path = keys_dir / "mod.rs"
         mod_rs = register_table(mod_path.read_text(encoding="utf-8"), plan.generation, plan.version)
         writes += [(gen_path, render_gen_rs(plan.generation, plan.version, entries)), (mod_path, mod_rs)]
+    if plan.rewrite_signers and plan.signers is not None:
+        writes.append((repo / DEVICE_DIR / "signers.rs", render_signers_rs(plan.signers)))
     if plan.signers_drift and plan.signers is not None:
-        device_dir = repo / DEVICE_DIR
-        device_mod = device_dir / "mod.rs"
-        writes += [
-            (device_dir / "signers.rs", render_signers_rs(plan.signers)),
-            (device_mod, update_device_pins(device_mod.read_text(encoding="utf-8"), plan.signers)),
-        ]
+        device_mod = repo / DEVICE_DIR / "mod.rs"
+        writes.append((device_mod, update_device_pins(device_mod.read_text(encoding="utf-8"), plan.signers)))
+    if plan.release_drift and plan.release is not None:
+        release_path = repo / RELEASE_RS
+        writes.append((release_path, update_release_rs(release_path.read_text(encoding="utf-8"), plan.release)))
     for path, text in writes:
         path.write_text(text, encoding="utf-8")
     return [path for path, _ in writes]
@@ -616,6 +752,8 @@ def apply_sync(repo: Path, plan: SyncPlan, entries: KeyTableEntries) -> list[Pat
 
 SYNC_MARKER = "happ-sub-sync-sha256"
 SIGNERS_SECTION = "Signing certificate changed: SSAID values computed by clients change for new installs"
+RELEASE_SECTION = "Happ version updated"
+RELEASE_UNKNOWN_SECTION = "Happ version not updated: User-Agent builder not found"
 
 
 def _describe_signers(signers: Signers) -> str:
@@ -641,31 +779,74 @@ def _signers_section(plan: SyncPlan) -> list[str]:
     if plan.device_happ_version is not None and plan.device_happ_version != plan.signers.apk_version:
         lines += [
             "",
-            f"`HAPP_VERSION` in `src/device/mod.rs` is still {plan.device_happ_version}. "
-            "`signers_digest_pinned` fails until `HAPP_VERSION`, `HAPP_VERSION_CODE` and `HAPP_UA_BUILD_STAMP` "
-            f"describe Happ {plan.signers.apk_version}; those are not derived from the APK signature.",
+            f"`HAPP_VERSION` is still {plan.device_happ_version}. `signers_digest_pinned` fails until the "
+            f"release constants describe Happ {plan.signers.apk_version}.",
         ]
     return lines
+
+
+def _describe_release(release: Release) -> str:
+    return (
+        f"Happ {release.version}, versionCode {release.version_code}, "
+        f"User-Agent build stamp `{release.ua_build_stamp}`, suffix `{release.ua_suffix}`"
+    )
+
+
+def _release_section(plan: SyncPlan) -> list[str]:
+    assert plan.release is not None
+    assert plan.previous_release is not None
+    text = (
+        f"`{RELEASE_RS.as_posix()}` is regenerated, so the User-Agent happ-sub sends identifies as "
+        f"Happ {plan.release.version}."
+    )
+    if plan.rewrite_signers and not plan.signers_drift:
+        text += " `HAPP_SIGNERS.apk_version` follows; the certificates are unchanged."
+    return [
+        f"## {RELEASE_SECTION}",
+        "",
+        f"- Before: {_describe_release(plan.previous_release)}",
+        f"- After: {_describe_release(plan.release)}",
+        "",
+        text,
+    ]
+
+
+def _release_unknown_section() -> list[str]:
+    return [
+        f"## {RELEASE_UNKNOWN_SECTION}",
+        "",
+        "The User-Agent builder was not found in this APK (see the `user_agent_builder` check), so "
+        f"`{RELEASE_RS.as_posix()}` is left unchanged. Bumping only `HAPP_VERSION` and `HAPP_VERSION_CODE` "
+        "would pair them with the old build stamp and suffix, a User-Agent no Happ release sends.",
+    ]
 
 
 def build_pr_body(plan: SyncPlan, meta: Mapping[str, Any], report: Mapping[str, Any], run_url: str | None) -> str:
     lines: list[str] = []
     if plan.keys_drift:
         assert plan.generation is not None
-        lines += [
+        lines.append(
             f"Happ {plan.version} ships a body key table that matches none of the tables in `src/keys/`. "
             f"This adds it as generation {plan.generation} (`{table_id(plan.generation, plan.version)}`) "
-            "and puts it first in `ALL_TABLES`. `DEFAULT_TABLE` is unchanged.",
-            "",
-        ]
+            "and puts it first in `ALL_TABLES`. `DEFAULT_TABLE` is unchanged."
+        )
+    elif plan.signers_drift:
+        lines.append(
+            f"Happ {plan.version} is signed with a certificate set that differs from `HAPP_SIGNERS`. "
+            f"Its body key table equals {plan.matched}."
+        )
+    elif plan.release_drift:
+        lines.append(
+            f"Happ {plan.version} is out. Its body key table equals {plan.matched} and its signing certificate is "
+            "unchanged, so only the release constants move."
+        )
+    lines.append("")
     if plan.signers_drift:
-        if not plan.keys_drift:
-            lines += [
-                f"Happ {plan.version} is signed with a certificate set that differs from `HAPP_SIGNERS`. "
-                f"Its body key table equals {plan.matched}.",
-                "",
-            ]
         lines += [*_signers_section(plan), ""]
+    if plan.release_drift:
+        lines += [*_release_section(plan), ""]
+    if plan.release_unknown:
+        lines += [*_release_unknown_section(), ""]
     lines += [
         f"- APK version: {meta.get('app_version')} (versionCode {meta.get('versionCode')})",
         f"- APK SHA-256: `{meta.get('apk_sha256')}`",

@@ -23,6 +23,7 @@ from happ_keys.combine import combine_keys
 from happ_keys.dex_parser import parse_dex_structure
 from happ_keys.native import UnicornNativeDumper
 from happ_keys.stego import decode_stego_entries
+from happ_keys.user_agent import check_user_agent_builder
 from happ_keys.verifiers import (
     CheckResult,
     VerificationReport,
@@ -139,6 +140,9 @@ class Extractor:
         )
         chk_stego = verify_steganography_payloads(stego_strings, expected_count=len(structure.stego_pairs))
         chk_anchor = verify_upstream_doc_anchor(keys)
+        user_agent, chk_user_agent = check_user_agent_builder(
+            self.dex_objects, self.version_name, int(self.version_code)
+        )
 
         checks: dict[str, CheckResult] = {
             "certificate_digest": chk_cert,
@@ -146,11 +150,12 @@ class Extractor:
             "domain_registry_asset": chk_domain_reg,
             "steganography_payloads": chk_stego,
             "upstream_doc_anchor": chk_anchor,
+            "user_agent_builder": chk_user_agent,
         }
 
         # upstream_doc_anchor mismatch is treated as a warning (keys may rotate), not failure
         critical_passed = chk_cert.passed and chk_shape.passed and chk_domain_reg.passed and chk_stego.passed
-        warning_count = 1 if not chk_anchor.passed else 0
+        warning_count = sum(not c.passed for c in (chk_anchor, chk_user_agent))
 
         kz1_c_full_key = native_strings[structure.kz1_c_key_id] + structure.kz1_c_literal
         kz1_c_full_iv = native_strings[structure.kz1_c_iv_id]
@@ -169,6 +174,8 @@ class Extractor:
                 "body_keys": len(keys),
                 "data_result_groups": data_result_groups,
             },
+            "ua_build_stamp": user_agent.build_stamp if user_agent else None,
+            "ua_suffix": user_agent.suffix if user_agent else None,
             "upstream_crypt5_commit": PINNED_CRYPT5_COMMIT,
             "patch_offset": hex(native_dumper.discovered_patch_offset)
             if native_dumper.discovered_patch_offset

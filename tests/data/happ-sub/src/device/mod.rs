@@ -5,16 +5,12 @@ use sha2::Sha256;
 
 mod signers;
 
+pub use crate::release::{HAPP_UA_BUILD_STAMP, HAPP_UA_SUFFIX, HAPP_VERSION, HAPP_VERSION_CODE};
+pub use crate::request::user_agent;
 pub use signers::HAPP_SIGNERS;
 
 /// Happ's Android package name.
 pub const HAPP_PACKAGE: &str = "su.happ.proxyutility";
-/// Happ release whose identity this module reproduces.
-pub const HAPP_VERSION: &str = "4.7.1";
-/// Android `versionCode` of [`HAPP_VERSION`].
-pub const HAPP_VERSION_CODE: u32 = 1703;
-/// Millisecond timestamp baked into Happ 4.7.1's User-Agent (2026-10-05 14:25:17 UTC).
-pub const HAPP_UA_BUILD_STAMP: &str = "1791210317680";
 
 /// APK signature scheme whose certificates Android hands to the SSAID derivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -107,13 +103,6 @@ fn check_key_len(len: usize) -> Result<(), DeviceError> {
     }
 }
 
-/// Happ's `User-Agent` for `os` (`Android` or `AndroidTV`) on a given UTC day of the month.
-pub fn user_agent(os: &str, utc_day_of_month: u32) -> String {
-    // `wb8.S`: the digit after the version code flips between even and odd UTC days.
-    let parity = if utc_day_of_month % 2 == 0 { '6' } else { '5' };
-    format!("Happ/{HAPP_VERSION}/{os}/{HAPP_UA_BUILD_STAMP}{HAPP_VERSION_CODE}{parity}50")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,19 +173,6 @@ mod tests {
             decode_user_key("0011"),
             Err(DeviceError::InvalidKeyLength(2))
         );
-    }
-
-    #[test]
-    fn user_agent_day_parity() {
-        assert_eq!(
-            user_agent("Android", 12),
-            "Happ/4.7.1/Android/17912103176801703650"
-        );
-        assert_eq!(
-            user_agent("Android", 13),
-            "Happ/4.7.1/Android/17912103176801703550"
-        );
-        assert!(user_agent("AndroidTV", 1).starts_with("Happ/4.7.1/AndroidTV/"));
     }
 
     #[test]

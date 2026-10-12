@@ -43,7 +43,10 @@ def test_acceptance_byte_identical_reproduction(apk_path: Path, ref_keys_json: P
     assert result.report.all_passed is True
     assert result.report.warnings_count == 0
 
-    # 4. The signer export is what happ-sub embeds as HAPP_SIGNERS
+    # 4. The User-Agent release constants happ-sub embeds in release.rs
+    assert (result.meta["ua_build_stamp"], result.meta["ua_suffix"]) == ("1791210317680", "50")
+
+    # 5. The signer export is what happ-sub embeds as HAPP_SIGNERS
     signers = json.loads(signers_file.read_text(encoding="utf-8"))
     assert signers["scheme"] == "v2"
     assert signers["apk_version"] == "4.7.1"
