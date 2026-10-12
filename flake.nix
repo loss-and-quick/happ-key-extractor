@@ -23,6 +23,7 @@
           ps.zstandard
           ps.androguard
           ps.cryptography
+          ps.faker
           ps.pytest
         ]);
 
