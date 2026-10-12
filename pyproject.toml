@@ -1,0 +1,29 @@
+[project]
+name = "happ-key-extractor"
+version = "0.1.0"
+description = "Extract and verify the Happ Android subscription body key table"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+  "androguard>=4.1",
+  "cryptography>=42",
+  "pillow>=10",
+  "pycryptodome>=3.20",
+  "unicorn>=2.1",
+  "zstandard>=0.22",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff==0.16.10"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".apk-cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PT", "C4"]

@@ -1,0 +1,29 @@
+{
+  "source": "https://github.com/Happ-proxy/happ-android/releases",
+  "apks": {
+    "4.7.1": {
+      "asset": "Happ.apk",
+      "url": "https://github.com/Happ-proxy/happ-android/releases/download/4.7.1/Happ.apk",
+      "size": 67542425,
+      "sha256": "488923701e7d46e556b8566e50f03ef1b13ad807be0299feb892b83a2242a093"
+    },
+    "4.5.0": {
+      "asset": "Happ_beta.apk",
+      "url": "https://github.com/Happ-proxy/happ-android/releases/download/4.5.0/Happ_beta.apk",
+      "size": 62332726,
+      "sha256": "4595d233c0788f7e6d6990bf9eac2f70be4abed27ee33302a96e549ec7c1754b"
+    },
+    "4.3.0": {
+      "asset": "Happ.apk",
+      "url": "https://github.com/Happ-proxy/happ-android/releases/download/4.3.0/Happ.apk",
+      "size": 65580525,
+      "sha256": "769814e86c8e464c71e3669ae3b44a5c9c5bfac19caad9f71cfaaf1b4b3a89de"
+    },
+    "3.26.3": {
+      "asset": "Happ.apk",
+      "url": "https://github.com/Happ-proxy/happ-android/releases/download/3.26.3/Happ.apk",
+      "size": 61716951,
+      "sha256": "9a0e44dee2c77eaf580af16feb279455b9adfe7c2d5c1e9934caa56017e7ea96"
+    }
+  }
+}
