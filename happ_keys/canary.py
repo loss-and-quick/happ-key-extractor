@@ -22,9 +22,6 @@ GENERATOR_API_URL: str = "https://crypto.happ.su/api-v2.php"
 _faker = Faker()
 
 
-_faker = Faker()
-
-
 def random_plausible_url() -> str:
     """Return a random realistic-looking target URL, e.g. https://www.rice-hughes.com/news/rooms/canary-a1b2c3d4e5f6."""
     probe_id = uuid.uuid4().hex[:12]
