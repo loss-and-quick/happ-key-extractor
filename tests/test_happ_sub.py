@@ -19,8 +19,37 @@ MOD_RS = (SNAPSHOT_DIR / "src" / "keys" / "mod.rs").read_text(encoding="utf-8")
 SIGNERS_RS = (SNAPSHOT_DIR / "src" / "device" / "signers.rs").read_text(encoding="utf-8")
 DEVICE_MOD_RS = (SNAPSHOT_DIR / "src" / "device" / "mod.rs").read_text(encoding="utf-8")
 RELEASE_RS = (SNAPSHOT_DIR / "src" / "release.rs").read_text(encoding="utf-8")
-HAPP_471 = happ_sub.Release(version="4.7.1", version_code=1703, ua_build_stamp="1791210317680", ua_suffix="50")
-HAPP_480 = happ_sub.Release(version="4.8.0", version_code=1720, ua_build_stamp="1792000000000", ua_suffix="41")
+HAPP_471 = happ_sub.Release(
+    version="4.7.1",
+    version_code=1703,
+    ua_build_stamp="1791210317680",
+    ua_suffix="50",
+    desktop=happ_sub.HappDesktopRelease(
+        version="4.5.4",
+        ua_build_stamp="2610141140",
+        ua_suffix="85",
+        bundle_id_linux="su.happ.desktop.linux",
+        api_version="1.0",
+    ),
+    incy=happ_sub.IncyAndroidRelease(version="3.7.0", version_code=370),
+    incy_desktop=happ_sub.IncyDesktopRelease(version="3.8.10"),
+)
+HAPP_480 = happ_sub.Release(
+    version="4.8.0",
+    version_code=1720,
+    ua_build_stamp="1792000000000",
+    ua_suffix="41",
+    desktop=happ_sub.HappDesktopRelease(
+        version="4.5.4",
+        ua_build_stamp="2610141140",
+        ua_suffix="85",
+        bundle_id_linux="su.happ.desktop.linux",
+        api_version="1.0",
+    ),
+    incy=happ_sub.IncyAndroidRelease(version="3.7.0", version_code=370),
+    incy_desktop=happ_sub.IncyDesktopRelease(version="3.8.10"),
+)
+HAPP_480_BASE = happ_sub.Release(version="4.8.0", version_code=1720, ua_build_stamp="1792000000000", ua_suffix="41")
 HAPP_CERT_SHA256 = "397e98abed03c5f263ffaf4e8a1043b2a59f538b99e75cf152fa05a7e8007d8d"
 # Not a certificate: happ-sub treats signer certificates as opaque bytes.
 FAKE_CERT = bytes((i * 37 + 11) % 256 for i in range(700))
@@ -494,7 +523,7 @@ def test_release_parser_rejects_unexpected_input(edit: Callable[[str], str], mes
 
 def test_release_from_meta_validates() -> None:
     meta = {"app_version": "4.8.0", "versionCode": 1720, "ua_build_stamp": "1792000000000", "ua_suffix": "41"}
-    assert happ_sub.release_from_meta(meta) == HAPP_480
+    assert happ_sub.release_from_meta(meta) == HAPP_480_BASE
     for bad, message in [
         ({"ua_suffix": None} | {k: v for k, v in meta.items() if k != "ua_suffix"}, "decimal digits"),
         ({k: v for k, v in meta.items() if k != "ua_build_stamp"}, "lacks the release constants"),
