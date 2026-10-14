@@ -243,14 +243,37 @@ jobs:
           path: out
 
       # The generator only needs the standard library, so no dependency install here.
+      - name: Fetch latest Happ Desktop and Incy releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -m happ_keys upstream-releases > out/upstream-releases.json
+          desktop_deb=$(jq -r '.happ_desktop.deb_asset.url // empty' out/upstream-releases.json)
+          if [ -n "$desktop_deb" ]; then
+            python -m happ_keys release-sync --repo happ-sub --from-upstream-happ-desktop --download-to out/Happ.linux.x64.deb > /dev/null
+          fi
+
       - name: Compare with happ-sub
         id: sync
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          desktop_args=()
+          if [ -f out/Happ.linux.x64.deb ]; then
+            desktop_args+=(--desktop-deb out/Happ.linux.x64.deb)
+          fi
+          incy_version=$(jq -r '.incy.android.version // empty' out/upstream-releases.json)
+          incy_version_code=$(jq -r '.incy.android.version_code // empty' out/upstream-releases.json)
+          incy_desktop_version=$(jq -r '.incy.desktop.version // empty' out/upstream-releases.json)
+          if [ -n "$incy_version" ] && [ -n "$incy_version_code" ]; then
+            desktop_args+=(--incy-version "$incy_version" --incy-version-code "$incy_version_code")
+          fi
+          if [ -n "$incy_desktop_version" ]; then
+            desktop_args+=(--incy-desktop-version "$incy_desktop_version")
+          fi
           python -m happ_keys happ-sub-sync \
             --keys out/keys.json --meta out/meta.json --report out/report.json --signers out/signers.json \
-            --repo happ-sub --write --pr-body out/pr-body.md --run-url "$RUN_URL" > out/sync.json
+            --repo happ-sub --write --pr-body out/pr-body.md --run-url "$RUN_URL" "${desktop_args[@]}" > out/sync.json
           cat out/sync.json
           {
             echo "drift=$(jq -r .drift out/sync.json)"

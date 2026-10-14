@@ -163,7 +163,42 @@ def run_happ_sub_sync(args: argparse.Namespace) -> int:
         # A null stamp means the User-Agent builder was not found; release.rs is then left alone.
         release_unknown = meta.get("ua_build_stamp") is None
         release = None if release_unknown else happ_sub.release_from_meta(meta)
-        plan = happ_sub.plan_sync(repo, entries, str(meta["app_version"]), signers, release, release_unknown)
+
+        desktop_rel = None
+        if getattr(args, "desktop_deb", None):
+            import happ_keys.desktop as desktop
+
+            desktop_rel = desktop.extract_happ_desktop_from_deb(args.desktop_deb)
+        elif (
+            getattr(args, "desktop_version", None)
+            and getattr(args, "desktop_stamp", None)
+            and getattr(args, "desktop_suffix", None)
+        ):
+            desktop_rel = happ_sub.HappDesktopRelease(
+                version=args.desktop_version,
+                ua_build_stamp=args.desktop_stamp,
+                ua_suffix=args.desktop_suffix,
+            )
+
+        incy_rel = None
+        if getattr(args, "incy_version", None) and getattr(args, "incy_version_code", None):
+            incy_rel = happ_sub.IncyAndroidRelease(version=args.incy_version, version_code=int(args.incy_version_code))
+
+        incy_desktop_rel = None
+        if getattr(args, "incy_desktop_version", None):
+            incy_desktop_rel = happ_sub.IncyDesktopRelease(version=args.incy_desktop_version)
+
+        plan = happ_sub.plan_sync(
+            repo,
+            entries,
+            str(meta["app_version"]),
+            signers,
+            release,
+            release_unknown,
+            desktop=desktop_rel,
+            incy=incy_rel,
+            incy_desktop=incy_desktop_rel,
+        )
         written = happ_sub.apply_sync(repo, plan, entries) if args.write else []
     except happ_sub.HappSubFormatError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -268,6 +303,128 @@ def run_incy(args: argparse.Namespace) -> int:
     return 0 if all_ok else 1
 
 
+def run_desktop_extract(args: argparse.Namespace) -> int:
+    import happ_keys.desktop as desktop
+
+    path = Path(args.path)
+    if not path.is_file():
+        print(f"Error: file does not exist: {path}", file=sys.stderr)
+        return 2
+    try:
+        if args.format == "deb" or path.suffix == ".deb":
+            release = desktop.extract_happ_desktop_from_deb(path)
+        else:
+            release = desktop.extract_happ_desktop_from_binary(path.read_bytes(), known_version=args.version)
+    except desktop.DesktopExtractError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    data = {
+        "version": release.version,
+        "ua_build_stamp": release.ua_build_stamp,
+        "ua_suffix": release.ua_suffix,
+        "bundle_id_linux": release.bundle_id_linux,
+        "api_version": release.api_version,
+    }
+    if args.output:
+        Path(args.output).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(json.dumps(data, indent=2))
+    return 0
+
+
+def run_release_sync(args: argparse.Namespace) -> int:
+    import happ_keys.desktop as desktop
+
+    repo = Path(args.repo)
+    try:
+        happ_release = None
+        if args.happ_version and args.happ_version_code and args.happ_stamp and args.happ_suffix:
+            happ_release = happ_sub.Release(
+                version=args.happ_version,
+                version_code=int(args.happ_version_code),
+                ua_build_stamp=args.happ_stamp,
+                ua_suffix=args.happ_suffix,
+            )
+
+        desktop_release = None
+        if args.from_upstream_happ_desktop:
+            info = desktop.fetch_latest_happ_desktop_release()
+            asset = info.get("deb_asset")
+            if not asset or not asset.get("url"):
+                raise happ_sub.HappSubFormatError("latest Happ Desktop release has no downloadable .deb asset")
+            deb_path = Path(args.download_to) if args.download_to else repo / ".happ-desktop.deb"
+            desktop.download_asset(str(asset["url"]), deb_path)
+            desktop_release = desktop.extract_happ_desktop_from_deb(deb_path)
+        elif args.desktop_deb:
+            desktop_release = desktop.extract_happ_desktop_from_deb(args.desktop_deb)
+        elif args.desktop_version and args.desktop_stamp and args.desktop_suffix:
+            desktop_release = happ_sub.HappDesktopRelease(
+                version=args.desktop_version,
+                ua_build_stamp=args.desktop_stamp,
+                ua_suffix=args.desktop_suffix,
+            )
+
+        incy_release = None
+        incy_desktop_release = None
+        if args.from_upstream_incy:
+            info = desktop.fetch_latest_incy_releases()
+            incy_release = info["android"]
+            incy_desktop_release = info["desktop"]
+        else:
+            if args.incy_version and args.incy_version_code:
+                incy_release = happ_sub.IncyAndroidRelease(
+                    version=args.incy_version,
+                    version_code=int(args.incy_version_code),
+                )
+            if args.incy_desktop_version:
+                incy_desktop_release = happ_sub.IncyDesktopRelease(version=args.incy_desktop_version)
+
+        plan = happ_sub.plan_release_sync(
+            repo,
+            happ=happ_release,
+            desktop=desktop_release,
+            incy=incy_release,
+            incy_desktop=incy_desktop_release,
+        )
+        written = happ_sub.apply_release_sync(repo, plan) if args.write else []
+    except (happ_sub.HappSubFormatError, desktop.DesktopExtractError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if plan.drift and args.pr_body:
+        Path(args.pr_body).write_text(happ_sub.build_release_pr_body(plan, args.run_url), encoding="utf-8")
+    result = plan.to_dict()
+    result["written"] = [str(p.relative_to(repo)) for p in written]
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def run_upstream_releases(args: argparse.Namespace) -> int:
+    import happ_keys.desktop as desktop
+
+    result: dict[str, Any] = {}
+    try:
+        if args.happ_desktop or (not args.happ_desktop and not args.incy):
+            result["happ_desktop"] = desktop.fetch_latest_happ_desktop_release()
+        if args.incy or (not args.happ_desktop and not args.incy):
+            info = desktop.fetch_latest_incy_releases()
+            result["incy"] = {
+                "android": {
+                    "version": info["android"].version if info["android"] else None,
+                    "version_code": info["android"].version_code if info["android"] else None,
+                },
+                "desktop": {
+                    "version": info["desktop"].version if info["desktop"] else None,
+                },
+                "android_asset": info["android_asset"],
+                "desktop_asset": info["desktop_asset"],
+            }
+    except desktop.DesktopExtractError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="happ_keys",
@@ -326,6 +483,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     sync_p.add_argument("--meta", required=True, help="meta.json written by `extract --meta`")
     sync_p.add_argument("--report", required=True, help="JSON report printed by `extract --report json`")
     sync_p.add_argument("--signers", help="signers.json written by `extract --signers`; compared with signers.rs")
+    sync_p.add_argument("--desktop-deb", help="Path to Happ Desktop .deb; extracts version, stamp and suffix")
+    sync_p.add_argument("--desktop-version", help="Happ Desktop version to sync into release.rs")
+    sync_p.add_argument("--desktop-stamp", help="Happ Desktop User-Agent build stamp (YYMMDDHHmm)")
+    sync_p.add_argument("--desktop-suffix", help="Happ Desktop User-Agent suffix")
+    sync_p.add_argument("--incy-version", help="Incy Android version to sync into release.rs")
+    sync_p.add_argument("--incy-version-code", type=int, help="Incy Android versionCode")
+    sync_p.add_argument("--incy-desktop-version", help="Incy Desktop version to sync into release.rs")
     sync_p.add_argument("--repo", required=True, help="Path to a happ-sub checkout")
     sync_p.add_argument(
         "--write",
@@ -334,6 +498,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     sync_p.add_argument("--pr-body", help="Write a pull request body (Markdown) here on drift")
     sync_p.add_argument("--run-url", help="CI run URL to cite in the pull request body")
+
+    desktop_extract_p = subparsers.add_parser(
+        "desktop-extract", help="Extract Happ Desktop release constants from a .deb or binary"
+    )
+    desktop_extract_p.add_argument("path", help="Path to Happ Desktop .deb or the Happ binary")
+    desktop_extract_p.add_argument("--format", choices=["auto", "deb", "binary"], default="auto")
+    desktop_extract_p.add_argument("--version", help="Known version when extracting from a raw binary")
+    desktop_extract_p.add_argument("-o", "--output", help="Write the extracted JSON here")
+
+    release_sync_p = subparsers.add_parser(
+        "release-sync", help="Sync desktop and Incy release constants in happ-sub/src/release.rs"
+    )
+    release_sync_p.add_argument("--repo", required=True, help="Path to a happ-sub checkout")
+    release_sync_p.add_argument("--happ-version", help="Happ Android version")
+    release_sync_p.add_argument("--happ-version-code", type=int, help="Happ Android versionCode")
+    release_sync_p.add_argument("--happ-stamp", help="Happ Android UA build stamp")
+    release_sync_p.add_argument("--happ-suffix", help="Happ Android UA suffix")
+    release_sync_p.add_argument("--desktop-deb", help="Path to Happ Desktop .deb")
+    release_sync_p.add_argument("--desktop-version", help="Happ Desktop version")
+    release_sync_p.add_argument("--desktop-stamp", help="Happ Desktop UA build stamp")
+    release_sync_p.add_argument("--desktop-suffix", help="Happ Desktop UA suffix")
+    release_sync_p.add_argument("--from-upstream-happ-desktop", action="store_true")
+    release_sync_p.add_argument("--download-to", help="Download upstream Happ Desktop .deb here")
+    release_sync_p.add_argument("--incy-version", help="Incy Android version")
+    release_sync_p.add_argument("--incy-version-code", type=int, help="Incy Android versionCode")
+    release_sync_p.add_argument("--incy-desktop-version", help="Incy Desktop version")
+    release_sync_p.add_argument("--from-upstream-incy", action="store_true")
+    release_sync_p.add_argument("--write", action="store_true", help="Write src/release.rs on drift")
+    release_sync_p.add_argument("--pr-body", help="Write a pull request body (Markdown) here on drift")
+    release_sync_p.add_argument("--run-url", help="CI run URL to cite in the pull request body")
+
+    upstream_p = subparsers.add_parser("upstream-releases", help="Show the latest Happ Desktop and Incy releases")
+    upstream_p.add_argument("--happ-desktop", action="store_true", help="Only query Happ Desktop")
+    upstream_p.add_argument("--incy", action="store_true", help="Only query Incy")
 
     incy_p = subparsers.add_parser("incy", help="Derive the incy://crypt1/ key and decrypt or verify its links")
     incy_sub = incy_p.add_subparsers(dest="incy_command", required=True)
@@ -368,6 +566,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "verify-url-keys": run_verify_url_keys,
         "fetch-apks": run_fetch_apks,
         "happ-sub-sync": run_happ_sub_sync,
+        "desktop-extract": run_desktop_extract,
+        "release-sync": run_release_sync,
+        "upstream-releases": run_upstream_releases,
         "incy": run_incy,
     }
     return handlers[args.subcommand](args)

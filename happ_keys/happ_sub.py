@@ -18,7 +18,7 @@ import hashlib
 import hmac
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -499,17 +499,100 @@ _RELEASE_FIELDS = (
 
 
 @dataclass(frozen=True)
+class HappDesktopRelease:
+    """Happ Desktop release constants: version, build stamp (YYMMDDHHmm) and suffix."""
+
+    version: str
+    ua_build_stamp: str
+    ua_suffix: str
+    bundle_id_linux: str = "su.happ.desktop.linux"
+    api_version: str = "1.0"
+
+    def rust_values(self) -> dict[tuple[str, str], str]:
+        vals = {
+            ("HAPP_DESKTOP_VERSION", "&str"): f'"{self.version}"',
+            ("HAPP_DESKTOP_UA_BUILD_STAMP", "&str"): f'"{self.ua_build_stamp}"',
+            ("HAPP_DESKTOP_UA_SUFFIX", "&str"): f'"{self.ua_suffix}"',
+        }
+        if self.bundle_id_linux:
+            vals[("HAPP_DESKTOP_BUNDLE_ID_LINUX", "&str")] = f'"{self.bundle_id_linux}"'
+        if self.api_version:
+            vals[("HAPP_API_VERSION", "&str")] = f'"{self.api_version}"'
+        return vals
+
+
+@dataclass(frozen=True)
+class IncyAndroidRelease:
+    """Incy Android release constants: version and versionCode."""
+
+    version: str
+    version_code: int
+
+    def rust_values(self) -> dict[tuple[str, str], str]:
+        return {
+            ("INCY_VERSION", "&str"): f'"{self.version}"',
+            ("INCY_VERSION_CODE", "u32"): str(self.version_code),
+        }
+
+
+@dataclass(frozen=True)
+class IncyDesktopRelease:
+    """Incy Desktop release constants: version."""
+
+    version: str
+
+    def rust_values(self) -> dict[tuple[str, str], str]:
+        return {
+            ("INCY_DESKTOP_VERSION", "&str"): f'"{self.version}"',
+        }
+
+
+@dataclass(frozen=True)
 class Release:
-    """What Happ's User-Agent carries for one APK: version, versionCode, build stamp and suffix."""
+    """What Happ's User-Agent carries for one APK: version, versionCode, build stamp and suffix.
+
+    Optionally carries Happ Desktop and Incy releases as well.
+    """
 
     version: str
     version_code: int
     ua_build_stamp: str
     ua_suffix: str
+    desktop: HappDesktopRelease | None = None
+    incy: IncyAndroidRelease | None = None
+    incy_desktop: IncyDesktopRelease | None = None
 
     def rust_values(self) -> dict[tuple[str, str], str]:
         values = (f'"{self.version}"', str(self.version_code), f'"{self.ua_build_stamp}"', f'"{self.ua_suffix}"')
-        return dict(zip(_RELEASE_FIELDS, values, strict=True))
+        vals = dict(zip(_RELEASE_FIELDS, values, strict=True))
+        if self.desktop is not None:
+            vals.update(self.desktop.rust_values())
+        if self.incy is not None:
+            vals.update(self.incy.rust_values())
+        if self.incy_desktop is not None:
+            vals.update(self.incy_desktop.rust_values())
+        return vals
+
+
+def check_happ_desktop_release(release: HappDesktopRelease) -> None:
+    _check_version(release.version)
+    if not (_DIGITS_RE.match(release.ua_build_stamp) and _DIGITS_RE.match(release.ua_suffix)):
+        raise HappSubFormatError("Happ Desktop User-Agent build stamp and suffix must be decimal digits")
+
+
+def check_incy_android_release(release: IncyAndroidRelease) -> None:
+    _check_version(release.version)
+    if not 0 < release.version_code < 2**32:
+        raise HappSubFormatError(f"versionCode {release.version_code} does not fit in u32")
+
+
+def check_incy_desktop_release(release: IncyDesktopRelease) -> None:
+    _check_version(release.version)
+
+
+_check_happ_desktop_release = check_happ_desktop_release
+_check_incy_android_release = check_incy_android_release
+_check_incy_desktop_release = check_incy_desktop_release
 
 
 def _check_release(release: Release) -> None:
@@ -518,6 +601,12 @@ def _check_release(release: Release) -> None:
         raise HappSubFormatError(f"versionCode {release.version_code} does not fit in u32")
     if not (_DIGITS_RE.match(release.ua_build_stamp) and _DIGITS_RE.match(release.ua_suffix)):
         raise HappSubFormatError("User-Agent build stamp and suffix must be decimal digits")
+    if release.desktop is not None:
+        _check_happ_desktop_release(release.desktop)
+    if release.incy is not None:
+        _check_incy_android_release(release.incy)
+    if release.incy_desktop is not None:
+        _check_incy_desktop_release(release.incy_desktop)
 
 
 def release_from_meta(meta: Mapping[str, Any]) -> Release:
@@ -535,15 +624,22 @@ def release_from_meta(meta: Mapping[str, Any]) -> Release:
     return release
 
 
-def _release_const(source: str, name: str, ty: str) -> re.Match[str]:
+def _try_release_const(source: str, name: str, ty: str) -> re.Match[str] | None:
     matches = list(re.finditer(_RELEASE_CONST_RE.format(name=name, ty=re.escape(ty)), source, re.M))
-    if len(matches) != 1:
+    if len(matches) > 1:
         raise HappSubFormatError(f"release.rs: expected one `pub const {name}: {ty}`, found {len(matches)}")
-    return matches[0]
+    return matches[0] if matches else None
+
+
+def _release_const(source: str, name: str, ty: str) -> re.Match[str]:
+    m = _try_release_const(source, name, ty)
+    if m is None:
+        raise HappSubFormatError(f"release.rs: expected one `pub const {name}: {ty}`, found 0")
+    return m
 
 
 def parse_release_rs(source: str) -> Release:
-    """Parse the four release constants from `release.rs`."""
+    """Parse the release constants from `release.rs` across all supported platforms."""
     values: dict[str, str] = {}
     for name, ty in _RELEASE_FIELDS:
         raw = _release_const(source, name, ty)["value"]
@@ -556,26 +652,143 @@ def parse_release_rs(source: str) -> Release:
             if not _DIGITS_RE.match(raw):
                 raise HappSubFormatError(f"release.rs: {name} is not a decimal literal")
             values[name] = raw
+
+    desktop: HappDesktopRelease | None = None
+    desktop_m = _try_release_const(source, "HAPP_DESKTOP_VERSION", "&str")
+    if desktop_m is not None:
+        d_ver_m = _STR_VALUE_RE.match(desktop_m["value"])
+        if not d_ver_m:
+            raise HappSubFormatError("release.rs: HAPP_DESKTOP_VERSION is not a plain string literal")
+        d_stamp_raw = _release_const(source, "HAPP_DESKTOP_UA_BUILD_STAMP", "&str")["value"]
+        d_stamp_m = _STR_VALUE_RE.match(d_stamp_raw)
+        if not d_stamp_m or not _DIGITS_RE.match(d_stamp_m["s"]):
+            raise HappSubFormatError("release.rs: HAPP_DESKTOP_UA_BUILD_STAMP is not a decimal string literal")
+        d_suffix_raw = _release_const(source, "HAPP_DESKTOP_UA_SUFFIX", "&str")["value"]
+        d_suffix_m = _STR_VALUE_RE.match(d_suffix_raw)
+        if not d_suffix_m or not _DIGITS_RE.match(d_suffix_m["s"]):
+            raise HappSubFormatError("release.rs: HAPP_DESKTOP_UA_SUFFIX is not a decimal string literal")
+
+        bundle_id = "su.happ.desktop.linux"
+        b_id_m = _try_release_const(source, "HAPP_DESKTOP_BUNDLE_ID_LINUX", "&str")
+        if b_id_m:
+            bm = _STR_VALUE_RE.match(b_id_m["value"])
+            if bm:
+                bundle_id = bm["s"]
+
+        api_ver = "1.0"
+        api_m = _try_release_const(source, "HAPP_API_VERSION", "&str")
+        if api_m:
+            am = _STR_VALUE_RE.match(api_m["value"])
+            if am:
+                api_ver = am["s"]
+
+        desktop = HappDesktopRelease(
+            version=d_ver_m["s"],
+            ua_build_stamp=d_stamp_m["s"],
+            ua_suffix=d_suffix_m["s"],
+            bundle_id_linux=bundle_id,
+            api_version=api_ver,
+        )
+
+    incy: IncyAndroidRelease | None = None
+    incy_m = _try_release_const(source, "INCY_VERSION", "&str")
+    if incy_m is not None:
+        i_ver_m = _STR_VALUE_RE.match(incy_m["value"])
+        if not i_ver_m:
+            raise HappSubFormatError("release.rs: INCY_VERSION is not a plain string literal")
+        i_code_raw = _release_const(source, "INCY_VERSION_CODE", "u32")["value"]
+        if not _DIGITS_RE.match(i_code_raw):
+            raise HappSubFormatError("release.rs: INCY_VERSION_CODE is not a decimal literal")
+        incy = IncyAndroidRelease(version=i_ver_m["s"], version_code=int(i_code_raw))
+
+    incy_desktop: IncyDesktopRelease | None = None
+    incy_d_m = _try_release_const(source, "INCY_DESKTOP_VERSION", "&str")
+    if incy_d_m is not None:
+        id_ver_m = _STR_VALUE_RE.match(incy_d_m["value"])
+        if not id_ver_m:
+            raise HappSubFormatError("release.rs: INCY_DESKTOP_VERSION is not a plain string literal")
+        incy_desktop = IncyDesktopRelease(version=id_ver_m["s"])
+
     return Release(
         version=values["HAPP_VERSION"],
         version_code=int(values["HAPP_VERSION_CODE"]),
         ua_build_stamp=values["HAPP_UA_BUILD_STAMP"],
         ua_suffix=values["HAPP_UA_SUFFIX"],
+        desktop=desktop,
+        incy=incy,
+        incy_desktop=incy_desktop,
     )
 
 
-def update_release_rs(source: str, release: Release) -> str:
+def update_release_rs(
+    source: str,
+    release: Release | HappDesktopRelease | IncyAndroidRelease | IncyDesktopRelease | None = None,
+    *,
+    desktop: HappDesktopRelease | None = None,
+    incy: IncyAndroidRelease | None = None,
+    incy_desktop: IncyDesktopRelease | None = None,
+) -> str:
     """Rewrite the values of the release constants; comments and layout stay as they are."""
-    _check_release(release)
+    rust_values: dict[tuple[str, str], str] = {}
+    if isinstance(release, Release):
+        _check_release(release)
+        values = (
+            f'"{release.version}"',
+            str(release.version_code),
+            f'"{release.ua_build_stamp}"',
+            f'"{release.ua_suffix}"',
+        )
+        rust_values.update(dict(zip(_RELEASE_FIELDS, values, strict=True)))
+        if release.desktop is not None:
+            rust_values.update(release.desktop.rust_values())
+        if release.incy is not None:
+            rust_values.update(release.incy.rust_values())
+        if release.incy_desktop is not None:
+            rust_values.update(release.incy_desktop.rust_values())
+    elif isinstance(release, HappDesktopRelease):
+        _check_happ_desktop_release(release)
+        rust_values.update(release.rust_values())
+    elif isinstance(release, IncyAndroidRelease):
+        _check_incy_android_release(release)
+        rust_values.update(release.rust_values())
+    elif isinstance(release, IncyDesktopRelease):
+        _check_incy_desktop_release(release)
+        rust_values.update(release.rust_values())
+
+    if desktop is not None:
+        _check_happ_desktop_release(desktop)
+        rust_values.update(desktop.rust_values())
+    if incy is not None:
+        _check_incy_android_release(incy)
+        rust_values.update(incy.rust_values())
+    if incy_desktop is not None:
+        _check_incy_desktop_release(incy_desktop)
+        rust_values.update(incy_desktop.rust_values())
+
     text = source
-    for (name, ty), value in release.rust_values().items():
+    for (name, ty), value in rust_values.items():
         m = _release_const(text, name, ty)
         text = text[: m.start("value")] + value + text[m.end("value") :]
     return text
 
 
-def release_sha256(release: Release) -> str:
-    canonical = f"{release.version}\n{release.version_code}\n{release.ua_build_stamp}\n{release.ua_suffix}\n"
+def release_sha256(release: Release | HappDesktopRelease | IncyAndroidRelease | IncyDesktopRelease) -> str:
+    if isinstance(release, HappDesktopRelease):
+        canonical = f"desktop:{release.version}\n{release.ua_build_stamp}\n{release.ua_suffix}\n"
+    elif isinstance(release, IncyAndroidRelease):
+        canonical = f"incy:{release.version}\n{release.version_code}\n"
+    elif isinstance(release, IncyDesktopRelease):
+        canonical = f"incy_desktop:{release.version}\n"
+    else:
+        canonical = f"{release.version}\n{release.version_code}\n{release.ua_build_stamp}\n{release.ua_suffix}\n"
+        if release.desktop is not None:
+            canonical += (
+                f"desktop:{release.desktop.version}\n{release.desktop.ua_build_stamp}\n{release.desktop.ua_suffix}\n"
+            )
+        if release.incy is not None:
+            canonical += f"incy:{release.incy.version}\n{release.incy.version_code}\n"
+        if release.incy_desktop is not None:
+            canonical += f"incy_desktop:{release.incy_desktop.version}\n"
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
 
@@ -660,6 +873,22 @@ class SyncPlan:
         }
 
 
+def _merge_release(release: Release | None, previous: Release | None) -> Release | None:
+    if release is None:
+        return None
+    if previous is None:
+        return release
+    return Release(
+        version=release.version,
+        version_code=release.version_code,
+        ua_build_stamp=release.ua_build_stamp,
+        ua_suffix=release.ua_suffix,
+        desktop=release.desktop if release.desktop is not None else previous.desktop,
+        incy=release.incy if release.incy is not None else previous.incy,
+        incy_desktop=release.incy_desktop if release.incy_desktop is not None else previous.incy_desktop,
+    )
+
+
 def plan_sync(
     repo: Path,
     entries: KeyTableEntries,
@@ -667,6 +896,9 @@ def plan_sync(
     signers: Signers | None = None,
     release: Release | None = None,
     release_unknown: bool = False,
+    desktop: HappDesktopRelease | None = None,
+    incy: IncyAndroidRelease | None = None,
+    incy_desktop: IncyDesktopRelease | None = None,
 ) -> SyncPlan:
     """Compare an extracted table, and if given the signer set and release constants, with happ-sub."""
     tables = load_tables(repo)
@@ -679,7 +911,31 @@ def plan_sync(
         and previous_signers is not None
         and (signers.scheme, signers.certs) != (previous_signers.scheme, previous_signers.certs)
     )
-    previous_release = load_release(repo) if release is not None else None
+    previous_release = (
+        load_release(repo)
+        if (release is not None or desktop is not None or incy is not None or incy_desktop is not None)
+        else None
+    )
+    if release is not None:
+        release = _merge_release(release, previous_release)
+        assert release is not None
+        if desktop is not None:
+            release = replace(release, desktop=desktop)
+        if incy is not None:
+            release = replace(release, incy=incy)
+        if incy_desktop is not None:
+            release = replace(release, incy_desktop=incy_desktop)
+    elif previous_release is not None and (desktop is not None or incy is not None or incy_desktop is not None):
+        release = Release(
+            version=previous_release.version,
+            version_code=previous_release.version_code,
+            ua_build_stamp=previous_release.ua_build_stamp,
+            ua_suffix=previous_release.ua_suffix,
+            desktop=desktop if desktop is not None else previous_release.desktop,
+            incy=incy if incy is not None else previous_release.incy,
+            incy_desktop=incy_desktop if incy_desktop is not None else previous_release.incy_desktop,
+        )
+
     release_drift = release is not None and release != previous_release
     fields: dict[str, Any] = {
         "signers_drift": signers_drift,
@@ -785,11 +1041,21 @@ def _signers_section(plan: SyncPlan) -> list[str]:
     return lines
 
 
-def _describe_release(release: Release) -> str:
-    return (
+def _describe_release(release: Release, other: Release | None = None) -> str:
+    parts = [
         f"Happ {release.version}, versionCode {release.version_code}, "
-        f"User-Agent build stamp `{release.ua_build_stamp}`, suffix `{release.ua_suffix}`"
-    )
+        + f"User-Agent build stamp `{release.ua_build_stamp}`, suffix `{release.ua_suffix}`"
+    ]
+    if release.desktop is not None and (other is None or release.desktop != other.desktop):
+        parts.append(
+            f"Happ Desktop {release.desktop.version}, User-Agent build stamp `{release.desktop.ua_build_stamp}`, "
+            + f"suffix `{release.desktop.ua_suffix}`"
+        )
+    if release.incy is not None and (other is None or release.incy != other.incy):
+        parts.append(f"Incy {release.incy.version}, versionCode {release.incy.version_code}")
+    if release.incy_desktop is not None and (other is None or release.incy_desktop != other.incy_desktop):
+        parts.append(f"Incy Desktop {release.incy_desktop.version}")
+    return "; ".join(parts)
 
 
 def _release_section(plan: SyncPlan) -> list[str]:
@@ -804,8 +1070,8 @@ def _release_section(plan: SyncPlan) -> list[str]:
     return [
         f"## {RELEASE_SECTION}",
         "",
-        f"- Before: {_describe_release(plan.previous_release)}",
-        f"- After: {_describe_release(plan.release)}",
+        f"- Before: {_describe_release(plan.previous_release, plan.release)}",
+        f"- After: {_describe_release(plan.release, plan.previous_release)}",
         "",
         text,
     ]
@@ -872,4 +1138,173 @@ def build_pr_body(plan: SyncPlan, meta: Mapping[str, Any], report: Mapping[str, 
         "",
         f"<!-- {SYNC_MARKER}: {plan.sync_sha256} -->",
     ]
+    return "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True)
+class ReleaseSyncPlan:
+    drift: bool
+    branch: str | None = None
+    title: str | None = None
+    sync_sha256: str | None = None
+    release: Release | None = None
+    previous_release: Release | None = None
+    happ_drift: bool = False
+    desktop_drift: bool = False
+    incy_drift: bool = False
+    incy_desktop_drift: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "drift": self.drift,
+            "branch": self.branch,
+            "title": self.title,
+            "sync_sha256": self.sync_sha256,
+            "happ_drift": self.happ_drift,
+            "desktop_drift": self.desktop_drift,
+            "incy_drift": self.incy_drift,
+            "incy_desktop_drift": self.incy_desktop_drift,
+            "release": {
+                "version": self.release.version if self.release else None,
+                "desktop_version": self.release.desktop.version if self.release and self.release.desktop else None,
+                "incy_version": self.release.incy.version if self.release and self.release.incy else None,
+                "incy_desktop_version": self.release.incy_desktop.version
+                if self.release and self.release.incy_desktop
+                else None,
+            }
+            if self.release
+            else None,
+        }
+
+
+def plan_release_sync(
+    repo: Path,
+    *,
+    happ: Release | None = None,
+    desktop: HappDesktopRelease | None = None,
+    incy: IncyAndroidRelease | None = None,
+    incy_desktop: IncyDesktopRelease | None = None,
+) -> ReleaseSyncPlan:
+    """Compare desired platform release versions against a happ-sub checkout's release.rs."""
+    previous = load_release(repo)
+    target = Release(
+        version=happ.version if happ is not None else previous.version,
+        version_code=happ.version_code if happ is not None else previous.version_code,
+        ua_build_stamp=happ.ua_build_stamp if happ is not None else previous.ua_build_stamp,
+        ua_suffix=happ.ua_suffix if happ is not None else previous.ua_suffix,
+        desktop=desktop if desktop is not None else previous.desktop,
+        incy=incy if incy is not None else previous.incy,
+        incy_desktop=incy_desktop if incy_desktop is not None else previous.incy_desktop,
+    )
+    _check_release(target)
+
+    happ_drift = happ is not None and (happ.version, happ.version_code, happ.ua_build_stamp, happ.ua_suffix) != (
+        previous.version,
+        previous.version_code,
+        previous.ua_build_stamp,
+        previous.ua_suffix,
+    )
+    desktop_drift = desktop is not None and desktop != previous.desktop
+    incy_drift = incy is not None and incy != previous.incy
+    incy_desktop_drift = incy_desktop is not None and incy_desktop != previous.incy_desktop
+
+    drift = happ_drift or desktop_drift or incy_drift or incy_desktop_drift
+    if not drift:
+        return ReleaseSyncPlan(drift=False, release=target, previous_release=previous)
+
+    # Pick branch and title
+    if happ_drift and not (desktop_drift or incy_drift or incy_desktop_drift):
+        branch = f"release/{target.version}"
+        title = f"feat(release): bump Happ to {target.version}"
+    elif desktop_drift and not (happ_drift or incy_drift or incy_desktop_drift):
+        assert target.desktop is not None
+        branch = f"release/happ-desktop-{target.desktop.version}"
+        title = f"feat(release): bump Happ Desktop to {target.desktop.version}"
+    elif incy_drift and not (happ_drift or desktop_drift or incy_desktop_drift):
+        assert target.incy is not None
+        branch = f"release/incy-{target.incy.version}"
+        title = f"feat(release): bump Incy to {target.incy.version}"
+    elif incy_desktop_drift and not (happ_drift or desktop_drift or incy_drift):
+        assert target.incy_desktop is not None
+        branch = f"release/incy-desktop-{target.incy_desktop.version}"
+        title = f"feat(release): bump Incy Desktop to {target.incy_desktop.version}"
+    else:
+        targets: list[str] = []
+        if happ_drift:
+            targets.append(f"Happ {target.version}")
+        if desktop_drift and target.desktop:
+            targets.append(f"Happ Desktop {target.desktop.version}")
+        if incy_drift and target.incy:
+            targets.append(f"Incy {target.incy.version}")
+        if incy_desktop_drift and target.incy_desktop:
+            targets.append(f"Incy Desktop {target.incy_desktop.version}")
+        title = f"feat(release): bump {_join_words(targets)}"
+        branch = f"release/platforms-{hashlib.sha256(title.encode()).hexdigest()[:8]}"
+
+    sync_sha = release_sha256(target)
+    return ReleaseSyncPlan(
+        drift=True,
+        branch=branch,
+        title=title,
+        sync_sha256=sync_sha,
+        release=target,
+        previous_release=previous,
+        happ_drift=happ_drift,
+        desktop_drift=desktop_drift,
+        incy_drift=incy_drift,
+        incy_desktop_drift=incy_desktop_drift,
+    )
+
+
+def apply_release_sync(repo: Path, plan: ReleaseSyncPlan) -> list[Path]:
+    if not plan.drift or plan.release is None:
+        return []
+    release_path = repo / RELEASE_RS
+    updated = update_release_rs(release_path.read_text(encoding="utf-8"), plan.release)
+    _ = release_path.write_text(updated, encoding="utf-8")
+    return [release_path]
+
+
+def build_release_pr_body(plan: ReleaseSyncPlan, run_url: str | None = None) -> str:
+    assert plan.release is not None
+    assert plan.previous_release is not None
+    lines = [
+        "## Release constants updated",
+        "",
+    ]
+    if plan.happ_drift:
+        lines += [
+            f"- **Happ Android**: bumped from {plan.previous_release.version} "
+            + f"({plan.previous_release.version_code}) to {plan.release.version} ({plan.release.version_code})",
+            f"  - Build stamp: `{plan.release.ua_build_stamp}` (was `{plan.previous_release.ua_build_stamp}`)",
+            f"  - Suffix: `{plan.release.ua_suffix}` (was `{plan.previous_release.ua_suffix}`)",
+        ]
+    if plan.desktop_drift and plan.release.desktop:
+        prev_d = plan.previous_release.desktop
+        prev_desc = (
+            f"{prev_d.version} (stamp `{prev_d.ua_build_stamp}`, suffix `{prev_d.ua_suffix}`)" if prev_d else "none"
+        )
+        lines += [
+            f"- **Happ Desktop**: bumped from {prev_desc} to {plan.release.desktop.version} "
+            + f"(stamp `{plan.release.desktop.ua_build_stamp}`, suffix `{plan.release.desktop.ua_suffix}`)"
+        ]
+    if plan.incy_drift and plan.release.incy:
+        prev_i = plan.previous_release.incy
+        prev_desc = f"{prev_i.version} ({prev_i.version_code})" if prev_i else "none"
+        lines += [
+            f"- **Incy Android**: bumped from {prev_desc} to {plan.release.incy.version} "
+            + f"({plan.release.incy.version_code})"
+        ]
+    if plan.incy_desktop_drift and plan.release.incy_desktop:
+        prev_id = plan.previous_release.incy_desktop
+        prev_desc = prev_id.version if prev_id else "none"
+        lines += [f"- **Incy Desktop**: bumped from {prev_desc} to {plan.release.incy_desktop.version}"]
+    lines += [
+        "",
+        f"`{RELEASE_RS.as_posix()}` was updated in place.",
+    ]
+    if run_url:
+        lines += ["", f"- Run: {run_url}"]
+    if plan.sync_sha256:
+        lines += ["", f"<!-- {SYNC_MARKER}: {plan.sync_sha256} -->"]
     return "\n".join(lines) + "\n"
