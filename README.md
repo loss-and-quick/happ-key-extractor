@@ -57,6 +57,9 @@ python -m pip install --require-hashes -r requirements.txt   # or: nix develop
 | `python -m happ_keys verify-url-keys [--fixtures-dir DIR] [--keys FILE]` | Decrypt the captured `happ://crypt5/` fixtures with the pinned RSA keys. |
 | `python -m happ_keys fetch-apks --dest DIR [--version V ...]` | Download the pinned test APKs into `DIR/<version>/<asset>` and verify each sha256. Files already cached and verified are not downloaded again. |
 | `python -m happ_keys happ-sub-sync --keys K --meta M --report R [--signers S] --repo HAPP_SUB [--write] [--pr-body FILE] [--run-url URL]` | Compare an extracted table with every `src/keys/gen*.rs` and the signers with `src/device/signers.rs` in a happ-sub checkout. On drift with `--write`, it generates the changed sources (see below). |
+| `python -m happ_keys incy derive --apk Incy.apk [-o incy-keymat.json]` | Derive the `incy://crypt1/` key `K1` from an INCY APK and print the asset digests, the key and its fingerprint. `-o` writes the keymat in the shape happ-sub embeds. |
+| `python -m happ_keys incy decrypt 'incy://crypt1/…' [--apk Incy.apk \| --key-hex HEX]` | Decrypt one link. Without `--apk` or `--key-hex` the key comes from `tests/data/incy/incy-keymat.json`. |
+| `python -m happ_keys incy verify-fixtures [--fixtures-dir DIR] [--apk Incy.apk]` | Decrypt the captured `incy://crypt1/` samples and compare them with their recorded plaintexts. |
 | `python -m happ_keys.canary tests/data/crypt5_keys.json` | Live crypt5 canary (network). |
 
 `keys.json` maps each id to its entry (`{"key01": "key01:3jk#R2d&Dd", ...}`), sorted and indented by 2, with no trailing newline.
@@ -108,7 +111,25 @@ A cached file whose sha256 does not match always fails.
 | `data.result.dec` | The decrypted and decompressed `assets/data.result` from Happ 4.7.1. |
 | `crypt5_keys.json` | `crypt5_keys.json` from [KernelEditor/HappDecrypt](https://github.com/KernelEditor/HappDecrypt) at commit `8d0b97b1875446abb16a0d1b62492a404e766860`, unmodified. happ-sub ships the same file as `src/keys/url-keys.json`. |
 | `crypt5/resp-*.json` | Links that crypto.happ.su generated for `https://example.com/...` probe URLs. |
+| `incy/incy-crypt1-samples.json` | `incy://crypt1/` payloads: the vector the vendor pins in [INCY-DEV/incy-link-encoder](https://github.com/INCY-DEV/incy-link-encoder), plus four generated with neutral `example.com` targets. happ-sub decrypts the same file. |
+| `incy/incy-keymat.json` | The two 4 KiB assets from `res/raw/incy_assets_{a,b}.bin` of Incy 3.7.0, so the fixtures verify without an APK. Identical to `assets/*.bin` in the vendor's MIT package. |
 | `happ-sub/src/keys/{gen1,mod}.rs`, `happ-sub/src/device/{signers,mod}.rs`, `happ-sub/src/release.rs` | Snapshots of happ-sub's `src/keys/`, `src/device/` and `src/release.rs` sources, used by the generator tests. |
+
+## The Incy keymat
+
+INCY (`llc.itdev.incy`, Android 3.7.0) hides a subscription URL behind `incy://crypt1/<base64url(iv ‖ ciphertext ‖ tag)>` — AES-256-GCM with a 12-byte IV and a 16-byte tag over the JSON `{"n":<name>,"url":<url>,"v":1}`. Unlike Happ, the key is in plain sight: two 4 KiB assets in `res/raw`, from which it is one SHA-256 with no secret input.
+
+```
+K1 = SHA-256("incy" || "deep" || "crypt1" || "v2026.06" || A[1024:1056] || B[2048:2080])
+```
+
+`derive` prints the derived key and its fingerprint, which is the value the vendor asserts in all four of its reference ports (`b6bf7084…`); a keymat that does not reproduce it is an error, not a warning. Because the assets are byte-identical in the APK and in the vendor's MIT package, the key is a published constant — the vendor states plainly that this scheme is obfuscation against scanners, not secrecy. `happ-sub` implements decryption under its `incy-crypt` and `builtin-incy-keys` features, and both implementations decrypt [`tests/data/incy/incy-crypt1-samples.json`](tests/data/incy), so they cannot drift apart unnoticed.
+
+Set `INCY_APK` to an INCY APK to check the real assets in the test suite:
+
+```sh
+INCY_APK=~/Downloads/Incy.apk pytest tests/test_incy.py
+```
 
 ## CI
 

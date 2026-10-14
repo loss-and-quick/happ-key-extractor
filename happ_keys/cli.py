@@ -11,6 +11,8 @@ from typing import Any
 
 from happ_keys import apks, happ_sub
 
+DEFAULT_INCY_FIXTURES = Path(__file__).parent.parent / "tests" / "data" / "incy"
+
 
 def format_text_report(report_dict: dict[str, Any]) -> str:
     """Format human-readable extraction report."""
@@ -176,6 +178,96 @@ def run_happ_sub_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def _incy_key(args: argparse.Namespace) -> tuple[bytes | None, str | None]:
+    """Resolve the key for an incy subcommand: --key-hex, then --apk, then the bundled keymat."""
+    from happ_keys import incy
+
+    if getattr(args, "key_hex", None):
+        return bytes.fromhex(args.key_hex), None
+    apk = getattr(args, "apk", None)
+    if apk:
+        apk_path = Path(apk)
+        if not apk_path.is_file():
+            return None, f"APK file does not exist: {apk_path}"
+        try:
+            return incy.derive_key(incy.read_keymat(apk_path)), None
+        except incy.IncyKeymatError as exc:
+            return None, str(exc)
+    if args.incy_command == "decrypt":
+        try:
+            return incy.derive_key(incy.read_keymat_from_fixtures(Path(args.fixtures_dir))), None
+        except incy.IncyKeymatError as exc:
+            return None, f"{exc} (pass --apk or --key-hex, or keep the keymat next to the fixtures)"
+    return None, None
+
+
+def run_incy(args: argparse.Namespace) -> int:
+    from happ_keys import incy
+
+    action = args.incy_command
+    if action == "derive":
+        apk = Path(args.apk)
+        if not apk.is_file():
+            print(f"Error: APK file does not exist: {apk}", file=sys.stderr)
+            return 2
+        try:
+            keymat = incy.read_keymat(apk)
+            key = incy.derive_key(keymat)
+        except incy.IncyKeymatError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        report = keymat.to_dict()
+        report["k1_hex"] = key.hex()
+        report["k1_fingerprint"] = incy.fingerprint(key)
+        if args.output:
+            Path(args.output).write_text(incy.keymat_json(keymat), encoding="utf-8")
+            print(f"Saved keymat to {args.output}", file=sys.stderr)
+        print(json.dumps(report, indent=2))
+        return 0
+
+    if action == "decrypt":
+        key, error = _incy_key(args)
+        if error is not None:
+            print(f"Error: {error}", file=sys.stderr)
+            return 2
+        assert key is not None
+        try:
+            link = incy.decrypt_link(args.link, key)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(link.to_dict(), indent=2))
+        return 0
+
+    fixtures_dir = Path(args.fixtures_dir)
+    if not fixtures_dir.is_dir():
+        print(f"Error: Fixtures dir not found: {fixtures_dir}", file=sys.stderr)
+        return 2
+    key, error = _incy_key(args)
+    if error is not None:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
+    try:
+        results = incy.verify_fixtures(fixtures_dir, key)
+    except incy.IncyKeymatError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    all_ok = True
+    print("=" * 60)
+    print("        INCY CRYPT1 (incy://crypt1/ fixtures)")
+    print("=" * 60)
+    for note, res in results.items():
+        ok = res.get("success", False)
+        if not ok:
+            all_ok = False
+        st = "OK" if ok else "FAIL"
+        detail = res.get("url") or res.get("error", "")
+        print(f"  [{st:4}] {note}: -> {detail}")
+    print("=" * 60)
+    return 0 if all_ok else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="happ_keys",
@@ -243,6 +335,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     sync_p.add_argument("--pr-body", help="Write a pull request body (Markdown) here on drift")
     sync_p.add_argument("--run-url", help="CI run URL to cite in the pull request body")
 
+    incy_p = subparsers.add_parser("incy", help="Derive the incy://crypt1/ key and decrypt or verify its links")
+    incy_sub = incy_p.add_subparsers(dest="incy_command", required=True)
+
+    incy_derive = incy_sub.add_parser("derive", help="Derive K1 from an INCY APK's keymat assets")
+    incy_derive.add_argument("--apk", required=True, help="Path to the INCY Android APK")
+    incy_derive.add_argument("-o", "--output", help="Write the keymat as JSON here (the shape happ-sub embeds)")
+
+    incy_decrypt = incy_sub.add_parser("decrypt", help="Decrypt one incy://crypt1/ link")
+    incy_decrypt.add_argument("link", help="The full incy://crypt1/ link")
+    incy_decrypt.add_argument("--apk", help="Derive the key from this INCY APK instead of the fixtures")
+    incy_decrypt.add_argument("--key-hex", help="Use this 32-byte key as hex instead of deriving one")
+    incy_decrypt.add_argument(
+        "--fixtures-dir",
+        default=str(DEFAULT_INCY_FIXTURES),
+        help=f"Directory holding incy-keymat.json (default: {DEFAULT_INCY_FIXTURES})",
+    )
+
+    incy_verify = incy_sub.add_parser("verify-fixtures", help="Decrypt the captured incy://crypt1/ samples")
+    incy_verify.add_argument(
+        "--fixtures-dir",
+        default=str(DEFAULT_INCY_FIXTURES),
+        help=f"Directory with the sample JSON and keymat (default: {DEFAULT_INCY_FIXTURES})",
+    )
+    incy_verify.add_argument("--apk", help="Derive the key from this INCY APK instead of the bundled keymat")
+    incy_verify.add_argument("--key-hex", help="Use this 32-byte key as hex instead of deriving one")
+
     args = parser.parse_args(argv)
 
     handlers = {
@@ -250,5 +368,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         "verify-url-keys": run_verify_url_keys,
         "fetch-apks": run_fetch_apks,
         "happ-sub-sync": run_happ_sub_sync,
+        "incy": run_incy,
     }
     return handlers[args.subcommand](args)
