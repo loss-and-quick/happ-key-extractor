@@ -131,18 +131,21 @@ Set `INCY_APK` to an INCY APK to check the real assets in the test suite:
 INCY_APK=~/Downloads/Incy.apk pytest tests/test_incy.py
 ```
 
-## CI
+## CI / CD
 
-`.github/workflows/keys.yml` runs on push to `main`, on pull requests, every Monday at 06:00 UTC and on manual dispatch.
+The workflows are split across:
 
-| Job | Runs on | What it does |
-| --- | --- | --- |
-| `lint-test` | all events | Ruff check and format check. Restores the pinned APKs from `actions/cache` (keyed on the hash of `tests/apks.json`), fetches any that are missing, then runs pytest with `HAPP_REQUIRE_APKS=1`. |
-| `extract` | all events | Downloads the latest Happ release and checks it against the asset digest GitHub reports. Extracts and verifies, then uploads `keys.json`, `meta.json`, `signers.json` and the report as an artifact. Outside pull requests, a failed extraction opens or comments on one tracking issue, and the next success closes it. |
-| `happ-sub-sync` | not on pull requests | Checks out `loss-and-quick/happ-sub` and runs `happ-sub-sync` on the key table, the signers and the release constants. On drift it commits `src/keys`, `src/device` and `src/release.rs`, pushes `keys/gen<N+1>-<version>` (or `signers/<version>` or `release/<version>` when the keys are unchanged) and opens a PR. If an open PR already has that branch or that digest, the job comments on it instead. |
-| `crypt5-canary` | schedule, dispatch | Generates a link through crypto.happ.su and decrypts it with `tests/data/crypt5_keys.json`. If the generator cannot be reached, the job logs a warning and passes. A decryption failure opens or comments on a tracking issue, and only a verified decryption closes it. |
+- `.github/workflows/ci.yml`: runs `lint-test` on pull requests, pushes to `main`, and manual dispatch.
+- `.github/workflows/sync.yml`: runs `extract`, `happ-sub-sync`, and scheduled `crypt5-canary` on push to `main`, every Monday at 06:00 UTC, and on manual dispatch.
 
-The workflow pushes nothing to this repository. All jobs have `contents: read`; `extract` and `crypt5-canary` also have `issues: write`. Actions are pinned by commit SHA.
+| Workflow | Job | Runs on | What it does |
+| --- | --- | --- | --- |
+| `ci.yml` | `lint-test` | PRs, main, dispatch | Ruff check and format check. Restores the pinned APKs from `actions/cache` (keyed on the hash of `tests/apks.json`), fetches any that are missing, then runs pytest with `HAPP_REQUIRE_APKS=1`. |
+| `sync.yml` | `extract` | main, schedule, dispatch | Downloads the latest Happ release and checks it against the asset digest GitHub reports. Extracts and verifies, then uploads `keys.json`, `meta.json`, `signers.json` and the report as an artifact. A failed extraction opens or comments on one tracking issue, and the next success closes it. |
+| `sync.yml` | `happ-sub-sync` | after `extract` | Checks out `loss-and-quick/happ-sub` and runs `happ-sub-sync` on the key table, the signers and the release constants. On drift it commits `src/keys`, `src/device` and `src/release.rs`, pushes `keys/gen<N+1>-<version>` (or `signers/<version>` or `release/<version>` when the keys are unchanged) and opens a PR. If an open PR already has that branch or that digest, the job comments on it instead. |
+| `sync.yml` | `crypt5-canary` | schedule, dispatch | Generates a link through crypto.happ.su and decrypts it with `tests/data/crypt5_keys.json`. If the generator cannot be reached, the job logs a warning and passes. A decryption failure opens or comments on a tracking issue, and only a verified decryption closes it. |
+
+The workflows push nothing to this repository. All jobs have `contents: read`; `extract` and `crypt5-canary` also have `issues: write`. Actions are pinned by commit SHA.
 
 ## Dependencies
 
