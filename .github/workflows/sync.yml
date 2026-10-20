@@ -309,15 +309,30 @@ jobs:
           VERSION: ${{ steps.sync.outputs.version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # An open PR that already carries this change (same branch, or same digest over the table and
-          # the signers) is reused, so weekly runs and later releases comment instead of duplicating it.
-          existing=$(gh pr list --repo "$HAPP_SUB_REPO" --state open --limit 100 --json number,headRefName,body \
-            | jq -r --arg b "$BRANCH" --arg m "happ-sub-sync-sha256: $SYNC_SHA" \
-              'map(select(.headRefName == $b or (.body | contains($m)))) | .[0].number // empty')
-          if [ -n "$existing" ]; then
-            gh pr comment "$existing" --repo "$HAPP_SUB_REPO" \
+          open_prs=$(gh pr list --repo "$HAPP_SUB_REPO" --state open --limit 100 --json number,headRefName,body)
+          # An open PR whose digest (table, signers, release constants) matches carries this very change:
+          # weekly runs comment on it instead of duplicating it.
+          same=$(jq -r --arg m "happ-sub-sync-sha256: $SYNC_SHA" \
+            'map(select(.body | contains($m))) | .[0].number // empty' <<<"$open_prs")
+          if [ -n "$same" ]; then
+            gh pr comment "$same" --repo "$HAPP_SUB_REPO" \
               --body "Same change still observed in Happ $VERSION (digest \`$SYNC_SHA\`): $RUN_URL"
             exit 0
+          fi
+          # An open PR on the same branch with another digest carries an older change, e.g. a build re-issued
+          # under the same version. Never push over it, it may hold manual fixes: open this change beside it.
+          pr_on() { jq -r --arg b "$1" 'map(select(.headRefName == $b)) | .[0].number // empty' <<<"$open_prs"; }
+          stale=$(pr_on "$BRANCH")
+          if [ -n "$stale" ]; then
+            BRANCH="$BRANCH-${SYNC_SHA:0:8}"
+            # Only a branch without an open PR is force-pushed (a merged PR's leftover branch is fine).
+            occupied=$(pr_on "$BRANCH")
+            if [ -n "$occupied" ]; then
+              echo "::warning::#$occupied already uses $BRANCH; not pushing over it"
+              gh pr comment "$occupied" --repo "$HAPP_SUB_REPO" \
+                --body "This change (digest \`$SYNC_SHA\`) is still observed, but this PR's body lost its digest marker, so it was not updated: $RUN_URL"
+              exit 0
+            fi
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -325,8 +340,12 @@ jobs:
           git add src/keys src/device src/release.rs src/incy_signers.rs
           git commit -m "$TITLE" -m "Synced by $RUN_URL"
           git push --force origin "$BRANCH"
-          gh pr create --repo "$HAPP_SUB_REPO" --base main --head "$BRANCH" \
-            --title "$TITLE" --body-file ../out/pr-body.md
+          url=$(gh pr create --repo "$HAPP_SUB_REPO" --base main --head "$BRANCH" \
+            --title "$TITLE" --body-file ../out/pr-body.md)
+          if [ -n "$stale" ]; then
+            gh pr comment "$stale" --repo "$HAPP_SUB_REPO" \
+              --body "Superseded by $url: the upstream build changed again under the same version (digest \`$SYNC_SHA\`)."
+          fi
 
   crypt5-canary:
     name: crypt5 canary
