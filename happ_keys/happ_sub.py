@@ -807,6 +807,39 @@ def _join_words(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
+def _happ_fields(release: Release) -> tuple[str, int, str, str]:
+    return (release.version, release.version_code, release.ua_build_stamp, release.ua_suffix)
+
+
+def _drifted_platforms(previous: Release | None, target: Release) -> list[tuple[str, str]]:
+    """Each client whose release constants differ from `previous`, as `(name, version)`, in release.rs order."""
+    out: list[tuple[str, str]] = []
+    if previous is None or _happ_fields(target) != _happ_fields(previous):
+        out.append(("Happ", target.version))
+    if target.desktop is not None and (previous is None or target.desktop != previous.desktop):
+        out.append(("Happ Desktop", target.desktop.version))
+    if target.incy is not None and (previous is None or target.incy != previous.incy):
+        out.append(("Incy", target.incy.version))
+    if target.incy_desktop is not None and (previous is None or target.incy_desktop != previous.incy_desktop):
+        out.append(("Incy Desktop", target.incy_desktop.version))
+    return out
+
+
+def _release_branch_title(previous: Release | None, target: Release) -> tuple[str, str]:
+    """Branch and PR title naming the clients that moved; a mix of clients shares a branch per target digest.
+
+    A re-issued build (same versionName, other constants) gets the same name; the workflow tells it apart
+    from the open PR by the sync digest.
+    """
+    platforms = _drifted_platforms(previous, target)
+    if len(platforms) == 1:
+        name, version = platforms[0]
+        slug = "" if name == "Happ" else name.lower().replace(" ", "-") + "-"
+        return f"release/{slug}{version}", f"feat(release): bump {name} to {version}"
+    title = f"feat(release): bump {_join_words([f'{name} {version}' for name, version in platforms])}"
+    return f"release/platforms-{release_sha256(target)[:8]}", title
+
+
 @dataclass(frozen=True)
 class SyncPlan:
     drift: bool
@@ -976,9 +1009,17 @@ def plan_sync(
         return SyncPlan(drift=False, table_sha256=digest, version=version, **fields)
     if generation is not None:
         branch, title = f"keys/gen{generation}-{version}", f"feat(keys): add {_join_words(items)} from Happ {version}"
+    elif signers_drift:
+        branch, title = f"signers/{version}", f"feat(device): update {_join_words(items)} from Happ {version}"
     else:
-        kind = "signers" if signers_drift else "release"
-        branch, title = f"{kind}/{version}", f"feat(device): update {_join_words(items)} from Happ {version}"
+        # Only release constants moved. The Desktop and Incy clients ship on their own schedule, so the
+        # branch and title name what moved instead of the Happ version, which may well be unchanged.
+        assert release is not None
+        platforms = _drifted_platforms(previous_release, release)
+        if [name for name, _ in platforms] == ["Happ"]:
+            branch, title = f"release/{version}", f"feat(device): update the release constants from Happ {version}"
+        else:
+            branch, title = _release_branch_title(previous_release, release)
     return SyncPlan(drift=True, table_sha256=digest, version=version, branch=branch, title=title, **fields)
 
 
@@ -1009,6 +1050,7 @@ def apply_sync(repo: Path, plan: SyncPlan, entries: KeyTableEntries) -> list[Pat
 SYNC_MARKER = "happ-sub-sync-sha256"
 SIGNERS_SECTION = "Signing certificate changed: SSAID values computed by clients change for new installs"
 RELEASE_SECTION = "Happ version updated"
+PLATFORM_RELEASE_SECTION = "Release constants updated"
 RELEASE_UNKNOWN_SECTION = "Happ version not updated: User-Agent builder not found"
 
 
@@ -1061,14 +1103,16 @@ def _describe_release(release: Release, other: Release | None = None) -> str:
 def _release_section(plan: SyncPlan) -> list[str]:
     assert plan.release is not None
     assert plan.previous_release is not None
-    text = (
-        f"`{RELEASE_RS.as_posix()}` is regenerated, so the User-Agent happ-sub sends identifies as "
-        f"Happ {plan.release.version}."
-    )
+    platforms = _drifted_platforms(plan.previous_release, plan.release)
+    happ_moved = any(name == "Happ" for name, _ in platforms)
+    named = _join_words([f"{name} {version}" for name, version in platforms])
+    agents = "User-Agent" if len(platforms) == 1 else "User-Agents"
+    verb = "identifies" if len(platforms) == 1 else "identify"
+    text = f"`{RELEASE_RS.as_posix()}` is regenerated, so the {agents} happ-sub sends {verb} as {named}."
     if plan.rewrite_signers and not plan.signers_drift:
         text += " `HAPP_SIGNERS.apk_version` follows; the certificates are unchanged."
     return [
-        f"## {RELEASE_SECTION}",
+        f"## {RELEASE_SECTION if happ_moved else PLATFORM_RELEASE_SECTION}",
         "",
         f"- Before: {_describe_release(plan.previous_release, plan.release)}",
         f"- After: {_describe_release(plan.release, plan.previous_release)}",
@@ -1102,10 +1146,20 @@ def build_pr_body(plan: SyncPlan, meta: Mapping[str, Any], report: Mapping[str, 
             f"Its body key table equals {plan.matched}."
         )
     elif plan.release_drift:
-        lines.append(
-            f"Happ {plan.version} is out. Its body key table equals {plan.matched} and its signing certificate is "
-            "unchanged, so only the release constants move."
-        )
+        assert plan.release is not None
+        platforms = _drifted_platforms(plan.previous_release, plan.release)
+        if any(name == "Happ" for name, _ in platforms):
+            lines.append(
+                f"Happ {plan.version} is out. Its body key table equals {plan.matched} and its signing certificate "
+                "is unchanged, so only the release constants move."
+            )
+        else:
+            named = _join_words([f"{name} {version}" for name, version in platforms])
+            lines.append(
+                f"{named} {'is' if len(platforms) == 1 else 'are'} out. Happ itself is unchanged at "
+                f"{plan.version}: its body key table equals {plan.matched} and its signing certificate is unchanged, "
+                "so only the release constants move."
+            )
     lines.append("")
     if plan.signers_drift:
         lines += [*_signers_section(plan), ""]
@@ -1198,48 +1252,15 @@ def plan_release_sync(
     )
     _check_release(target)
 
-    happ_drift = happ is not None and (happ.version, happ.version_code, happ.ua_build_stamp, happ.ua_suffix) != (
-        previous.version,
-        previous.version_code,
-        previous.ua_build_stamp,
-        previous.ua_suffix,
-    )
-    desktop_drift = desktop is not None and desktop != previous.desktop
-    incy_drift = incy is not None and incy != previous.incy
-    incy_desktop_drift = incy_desktop is not None and incy_desktop != previous.incy_desktop
-
-    drift = happ_drift or desktop_drift or incy_drift or incy_desktop_drift
-    if not drift:
+    platforms = _drifted_platforms(previous, target)
+    if not platforms:
         return ReleaseSyncPlan(drift=False, release=target, previous_release=previous)
-
-    # Pick branch and title
-    if happ_drift and not (desktop_drift or incy_drift or incy_desktop_drift):
-        branch = f"release/{target.version}"
-        title = f"feat(release): bump Happ to {target.version}"
-    elif desktop_drift and not (happ_drift or incy_drift or incy_desktop_drift):
-        assert target.desktop is not None
-        branch = f"release/happ-desktop-{target.desktop.version}"
-        title = f"feat(release): bump Happ Desktop to {target.desktop.version}"
-    elif incy_drift and not (happ_drift or desktop_drift or incy_desktop_drift):
-        assert target.incy is not None
-        branch = f"release/incy-{target.incy.version}"
-        title = f"feat(release): bump Incy to {target.incy.version}"
-    elif incy_desktop_drift and not (happ_drift or desktop_drift or incy_drift):
-        assert target.incy_desktop is not None
-        branch = f"release/incy-desktop-{target.incy_desktop.version}"
-        title = f"feat(release): bump Incy Desktop to {target.incy_desktop.version}"
-    else:
-        targets: list[str] = []
-        if happ_drift:
-            targets.append(f"Happ {target.version}")
-        if desktop_drift and target.desktop:
-            targets.append(f"Happ Desktop {target.desktop.version}")
-        if incy_drift and target.incy:
-            targets.append(f"Incy {target.incy.version}")
-        if incy_desktop_drift and target.incy_desktop:
-            targets.append(f"Incy Desktop {target.incy_desktop.version}")
-        title = f"feat(release): bump {_join_words(targets)}"
-        branch = f"release/platforms-{hashlib.sha256(title.encode()).hexdigest()[:8]}"
+    names = {name for name, _ in platforms}
+    happ_drift = "Happ" in names
+    desktop_drift = "Happ Desktop" in names
+    incy_drift = "Incy" in names
+    incy_desktop_drift = "Incy Desktop" in names
+    branch, title = _release_branch_title(previous, target)
 
     sync_sha = release_sha256(target)
     return ReleaseSyncPlan(

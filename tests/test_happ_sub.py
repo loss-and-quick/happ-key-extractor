@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -615,6 +616,99 @@ def test_cli_sync_release_drift_pr_body(
     assert "`HAPP_SIGNERS.apk_version` follows" in body
     assert happ_sub.SIGNERS_SECTION not in body
     assert f"<!-- happ-sub-sync-sha256: {result['sync_sha256']} -->" in body
+
+
+INCY_379 = happ_sub.IncyAndroidRelease(version="3.7.9", version_code=379)
+INCY_DESKTOP_390 = happ_sub.IncyDesktopRelease(version="3.9.0")
+
+
+def test_incy_only_drift_names_incy_not_happ(happ_sub_repo: Path) -> None:
+    """Happ unchanged, Incy moved: the branch and title must not claim a Happ release."""
+    entries = happ_sub.table_from_keys_json(_reference_keys())
+
+    plan = happ_sub.plan_sync(happ_sub_repo, entries, "4.7.1", _happ_signers(), HAPP_471, incy=INCY_379)
+    assert (plan.keys_drift, plan.signers_drift, plan.release_drift) == (False, False, True)
+    assert plan.branch == "release/incy-3.7.9"
+    assert plan.title == "feat(release): bump Incy to 3.7.9"
+
+    both = happ_sub.plan_sync(
+        happ_sub_repo, entries, "4.7.1", _happ_signers(), HAPP_471, incy=INCY_379, incy_desktop=INCY_DESKTOP_390
+    )
+    assert both.title == "feat(release): bump Incy 3.7.9 and Incy Desktop 3.9.0"
+    assert str(both.branch).startswith("release/platforms-")
+    # A later Incy release is a different change, so it must not land on the branch of an open PR.
+    later = happ_sub.plan_sync(
+        happ_sub_repo,
+        entries,
+        "4.7.1",
+        _happ_signers(),
+        HAPP_471,
+        incy=happ_sub.IncyAndroidRelease(version="3.8.0", version_code=380),
+        incy_desktop=INCY_DESKTOP_390,
+    )
+    assert later.branch != both.branch
+
+
+def test_happ_and_incy_drift_name_both(happ_sub_repo: Path) -> None:
+    entries = happ_sub.table_from_keys_json(_reference_keys())
+    plan = happ_sub.plan_sync(happ_sub_repo, entries, "4.8.0", _happ_signers("4.8.0"), HAPP_480, incy=INCY_379)
+
+    assert plan.title == "feat(release): bump Happ 4.8.0 and Incy 3.7.9"
+    assert str(plan.branch).startswith("release/platforms-")
+
+
+def test_plan_release_sync_names_each_platform(happ_sub_repo: Path) -> None:
+    plan = happ_sub.plan_release_sync(happ_sub_repo, incy=INCY_379)
+    assert (plan.branch, plan.title) == ("release/incy-3.7.9", "feat(release): bump Incy to 3.7.9")
+    assert (plan.happ_drift, plan.incy_drift, plan.incy_desktop_drift) == (False, True, False)
+
+    plan = happ_sub.plan_release_sync(happ_sub_repo, incy_desktop=INCY_DESKTOP_390)
+    assert (plan.branch, plan.title) == ("release/incy-desktop-3.9.0", "feat(release): bump Incy Desktop to 3.9.0")
+
+    plan = happ_sub.plan_release_sync(happ_sub_repo, happ=HAPP_480_BASE)
+    assert (plan.branch, plan.title) == ("release/4.8.0", "feat(release): bump Happ to 4.8.0")
+
+    assert happ_sub.plan_release_sync(happ_sub_repo, incy=HAPP_471.incy).drift is False
+
+
+def test_reissued_build_keeps_the_branch_but_not_the_digest(happ_sub_repo: Path) -> None:
+    """Same versionName, new versionCode: the workflow tells it from the open PR by `sync_sha256`."""
+    entries = happ_sub.table_from_keys_json(_reference_keys())
+    first = happ_sub.plan_sync(
+        happ_sub_repo, entries, "4.7.1", _happ_signers(), HAPP_471, incy=replace(INCY_379, version_code=1379)
+    )
+    second = happ_sub.plan_sync(happ_sub_repo, entries, "4.7.1", _happ_signers(), HAPP_471, incy=INCY_379)
+
+    assert first.branch == second.branch == "release/incy-3.7.9"
+    assert first.sync_sha256 != second.sync_sha256
+
+
+def test_cli_sync_incy_only_pr_body(happ_sub_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    args = _write_extraction(tmp_path, _reference_keys(), list(_happ_signers().certs))
+    meta_path = tmp_path / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta |= {"app_version": "4.7.1", "versionCode": 1703, "ua_build_stamp": "1791210317680", "ua_suffix": "50"}
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    pr_body = tmp_path / "pr.md"
+
+    result = _run_sync(
+        happ_sub_repo,
+        [
+            *args,
+            *("--incy-version", "3.7.9", "--incy-version-code", "379", "--incy-desktop-version", "3.9.0"),
+        ],
+        pr_body,
+        capsys,
+    )
+
+    assert result["branch"] != "release/4.7.1"
+    assert result["title"] == "feat(release): bump Incy 3.7.9 and Incy Desktop 3.9.0"
+    body = pr_body.read_text(encoding="utf-8")
+    assert body.startswith("Incy 3.7.9 and Incy Desktop 3.9.0 are out. Happ itself is unchanged at 4.7.1")
+    assert "Happ 4.7.1 is out" not in body
+    assert f"## {happ_sub.PLATFORM_RELEASE_SECTION}" in body
+    assert f"## {happ_sub.RELEASE_SECTION}" not in body
+    assert "identify as Incy 3.7.9 and Incy Desktop 3.9.0." in body
 
 
 def test_missing_release_rs_is_a_format_error(happ_sub_repo: Path) -> None:
