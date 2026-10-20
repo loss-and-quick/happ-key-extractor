@@ -20,6 +20,7 @@ env:
   FAILURE_ISSUE_TITLE: "Happ key extraction failed on the latest release"
   CANARY_ISSUE_TITLE: "crypt5 canary failed: URL keys rotated?"
   UA_ISSUE_TITLE: "Happ UA builder not found"
+  INCY_ISSUE_TITLE: "Incy APK no longer matches happ-sub's pins"
 
 jobs:
   extract:
@@ -168,6 +169,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      issues: write
     concurrency:
       group: happ-sub-sync
       cancel-in-progress: false
@@ -214,6 +216,12 @@ jobs:
           if [ -n "$desktop_deb" ]; then
             python -m happ_keys release-sync --repo happ-sub --from-upstream-happ-desktop --download-to out/Happ.linux.x64.deb > /dev/null
           fi
+          # The Incy Android bump is checked against this APK; without it the bump waits for a later run.
+          incy_apk=$(jq -r '.incy.android_asset.url // empty' out/upstream-releases.json)
+          if [ -n "$incy_apk" ]; then
+            curl -fsSL --max-time 900 --retry 3 --retry-delay 15 --retry-all-errors -o out/Incy.apk "$incy_apk" \
+              || { echo "::warning::Could not download $incy_apk; Incy Android is not synced this run"; rm -f out/Incy.apk; }
+          fi
 
       - name: Compare with happ-sub
         id: sync
@@ -233,6 +241,9 @@ jobs:
           if [ -n "$incy_desktop_version" ]; then
             desktop_args+=(--incy-desktop-version "$incy_desktop_version")
           fi
+          if [ -f out/Incy.apk ]; then
+            desktop_args+=(--incy-apk out/Incy.apk)
+          fi
           python -m happ_keys happ-sub-sync \
             --keys out/keys.json --meta out/meta.json --report out/report.json --signers out/signers.json \
             --repo happ-sub --write --pr-body out/pr-body.md --run-url "$RUN_URL" "${desktop_args[@]}" > out/sync.json
@@ -247,6 +258,45 @@ jobs:
           if [ "$(jq -r .drift out/sync.json)" = "false" ]; then
             echo "No drift: extracted table equals $(jq -r .matched out/sync.json) and the signers and release constants match $HAPP_SUB_REPO."
           fi
+          unverified=$(jq -r '.incy_unverified // empty' out/sync.json)
+          if [ -n "$unverified" ]; then
+            echo "::warning::$unverified"
+          fi
+
+      # A new Incy APK whose certificate or keymat differs from happ-sub's pins is not synced: it needs a person.
+      - name: Track the Incy pin issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --state open --limit 100 --json number,title \
+            | jq -r --arg t "$INCY_ISSUE_TITLE" 'map(select(.title == $t)) | .[0].number // empty')
+          problems=$(jq -r '.incy_problems | map("- " + .) | join("\n")' out/sync.json)
+          if [ -z "$problems" ]; then
+            # Close only on an APK that was actually read and matched, never on a run that could not check one.
+            if [ -n "$existing" ] && [ "$(jq -r .incy_verified out/sync.json)" = "true" ]; then
+              gh issue close "$existing" --comment "The latest Incy APK matches happ-sub's pins again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file - <<EOF
+          Still differs: $RUN_URL
+
+          $problems
+          EOF
+            exit 0
+          fi
+          gh issue create --title "$INCY_ISSUE_TITLE" --body-file - <<EOF
+          The latest Incy Android APK differs from what happ-sub pins, so \`INCY_VERSION\` was not moved.
+
+          $problems
+
+          - Run: $RUN_URL
+
+          Regenerate \`src/incy_signers.rs\` (with \`happ_keys.apk_signer.get_ssaid_signers\`) or \`src/keys/incy-keymat.json\` (with \`python -m happ_keys incy derive --apk Incy.apk -o ...\`) in happ-sub by hand: both move the SSAID and \`incy://crypt1/\` pins.
+          EOF
 
       - name: Open or update the happ-sub pull request
         if: steps.sync.outputs.drift == 'true'
@@ -272,8 +322,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add src/keys src/device src/release.rs
-          git commit -m "$TITLE" -m "Extracted from Happ $VERSION by $RUN_URL"
+          git add src/keys src/device src/release.rs src/incy_signers.rs
+          git commit -m "$TITLE" -m "Synced by $RUN_URL"
           git push --force origin "$BRANCH"
           gh pr create --repo "$HAPP_SUB_REPO" --base main --head "$BRANCH" \
             --title "$TITLE" --body-file ../out/pr-body.md
