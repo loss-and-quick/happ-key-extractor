@@ -671,6 +671,51 @@ def test_plan_release_sync_names_each_platform(happ_sub_repo: Path) -> None:
     assert happ_sub.plan_release_sync(happ_sub_repo, incy=HAPP_471.incy).drift is False
 
 
+INCY_SIGNERS_RS = (SNAPSHOT_DIR / "src" / "incy_signers.rs").read_text(encoding="utf-8")
+
+
+def _incy_apk(version: str = "3.7.9", version_code: int = 379, **changes: object) -> happ_sub.IncyApk:
+    """An Incy APK that carries exactly what the happ-sub snapshot pins, unless `changes` say otherwise."""
+    (cert,) = (
+        happ_sub._parse_byte_array(m["body"], m["name"]) for m in happ_sub._CERT_CONST_RE.finditer(INCY_SIGNERS_RS)
+    )
+    pins = happ_sub.load_incy_pins(SNAPSHOT_DIR)
+    apk = happ_sub.IncyApk(
+        version=version,
+        version_code=version_code,
+        scheme=pins.scheme,
+        certs=(cert,),
+        keymat_a=pins.keymat_a,
+        keymat_b=pins.keymat_b,
+    )
+    return replace(apk, **changes)
+
+
+def test_incy_pins_parse_the_snapshot() -> None:
+    pins = happ_sub.load_incy_pins(SNAPSHOT_DIR)
+    assert pins.scheme == "v3"
+    assert pins.cert_sha256 == ("e1430d81de511c72253a6a409910e609686f084e3944eab6f154999ac7128b13",)
+    assert pins.apk_version == "3.7.0"
+    assert (len(pins.keymat_a), len(pins.keymat_b)) == (4096, 4096)
+    assert happ_sub.incy_apk_problems(pins, _incy_apk(), "3.7.9") == []
+
+
+def test_update_incy_signers_rs_moves_only_apk_version() -> None:
+    updated = happ_sub.update_incy_signers_rs(INCY_SIGNERS_RS, "3.7.9")
+    assert updated == INCY_SIGNERS_RS.replace('apk_version: "3.7.0"', 'apk_version: "3.7.9"')
+    assert happ_sub.parse_incy_signers_rs(updated)[2] == "3.7.9"
+    with pytest.raises(happ_sub.HappSubFormatError, match="refusing"):
+        happ_sub.update_incy_signers_rs(INCY_SIGNERS_RS, '3.7.9"; evil')
+
+
+def test_incy_gate_takes_the_version_code_from_the_apk(happ_sub_repo: Path) -> None:
+    tag = happ_sub.IncyAndroidRelease(version="3.7.9", version_code=379)
+    gate = happ_sub.gate_incy_release(happ_sub_repo, tag, _incy_apk(version_code=1379))
+    assert gate == happ_sub.IncyGate(
+        release=happ_sub.IncyAndroidRelease(version="3.7.9", version_code=1379), verified=True
+    )
+
+
 def test_reissued_build_keeps_the_branch_but_not_the_digest(happ_sub_repo: Path) -> None:
     """Same versionName, new versionCode: the workflow tells it from the open PR by `sync_sha256`."""
     entries = happ_sub.table_from_keys_json(_reference_keys())
@@ -683,7 +728,48 @@ def test_reissued_build_keeps_the_branch_but_not_the_digest(happ_sub_repo: Path)
     assert first.sync_sha256 != second.sync_sha256
 
 
-def test_cli_sync_incy_only_pr_body(happ_sub_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_incy_gate_without_incy_in_release_rs(happ_sub_repo: Path) -> None:
+    release_rs = happ_sub_repo / "src" / "release.rs"
+    source = release_rs.read_text(encoding="utf-8")
+    kept = [line for line in source.splitlines(keepends=True) if "INCY_VERSION" not in line]
+    release_rs.write_text("".join(kept), encoding="utf-8")
+    assert happ_sub.load_release(happ_sub_repo).incy is None
+
+    gate = happ_sub.gate_incy_release(happ_sub_repo, INCY_379, _incy_apk())
+    assert gate.release == INCY_379
+    assert happ_sub.gate_incy_release(happ_sub_repo, INCY_379, None).unverified is not None
+
+
+@pytest.mark.parametrize(
+    ("changes", "problem"),
+    [
+        ({"certs": (FAKE_CERT,)}, "`INCY_SIGNER_SHA256` pins e1430d81"),
+        ({"scheme": "v2"}, "signed with scheme v2"),
+        ({"keymat_b": b"\x00" * 4096}, "keymat assets differ"),
+        ({"version": "3.8.0"}, "tagged 3.7.9 is Incy 3.8.0"),
+    ],
+)
+def test_incy_gate_holds_back_a_changed_apk(happ_sub_repo: Path, changes: dict[str, object], problem: str) -> None:
+    tag = happ_sub.IncyAndroidRelease(version="3.7.9", version_code=379)
+    gate = happ_sub.gate_incy_release(happ_sub_repo, tag, _incy_apk(**changes))
+    assert gate.release is None
+    assert any(problem in p for p in gate.problems), gate.problems
+
+
+def test_incy_gate_without_apk(happ_sub_repo: Path) -> None:
+    new = happ_sub.gate_incy_release(happ_sub_repo, INCY_379, None)
+    assert new.release is None
+    assert new.unverified == "Incy 3.7.9 was not checked: its APK is not available"
+    # The version happ-sub already has needs no APK and is not reported, but nor is it verified.
+    assert happ_sub.gate_incy_release(happ_sub_repo, HAPP_471.incy, None) == happ_sub.IncyGate()
+    same = happ_sub.gate_incy_release(happ_sub_repo, HAPP_471.incy, _incy_apk("3.7.0", 370))
+    assert same == happ_sub.IncyGate(release=HAPP_471.incy, verified=True)
+
+
+def test_cli_sync_incy_only_pr_body(
+    happ_sub_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("happ_keys.incy.inspect_apk", lambda _path: _incy_apk())
     args = _write_extraction(tmp_path, _reference_keys(), list(_happ_signers().certs))
     meta_path = tmp_path / "meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -696,11 +782,15 @@ def test_cli_sync_incy_only_pr_body(happ_sub_repo: Path, tmp_path: Path, capsys:
         [
             *args,
             *("--incy-version", "3.7.9", "--incy-version-code", "379", "--incy-desktop-version", "3.9.0"),
+            *("--incy-apk", str(tmp_path / "Incy.apk")),
         ],
         pr_body,
         capsys,
     )
 
+    # `_write_extraction` records the signers as 4.8.0, so signers.rs follows too; that is not the point here.
+    assert result["written"][-2:] == ["src/release.rs", "src/incy_signers.rs"]
+    assert happ_sub.load_incy_pins(happ_sub_repo).apk_version == "3.7.9"
     assert result["branch"] != "release/4.7.1"
     assert result["title"] == "feat(release): bump Incy 3.7.9 and Incy Desktop 3.9.0"
     body = pr_body.read_text(encoding="utf-8")
@@ -709,6 +799,36 @@ def test_cli_sync_incy_only_pr_body(happ_sub_repo: Path, tmp_path: Path, capsys:
     assert f"## {happ_sub.PLATFORM_RELEASE_SECTION}" in body
     assert f"## {happ_sub.RELEASE_SECTION}" not in body
     assert "identify as Incy 3.7.9 and Incy Desktop 3.9.0." in body
+    assert happ_sub.INCY_HELD_BACK_SECTION not in body
+    assert result["incy_verified"] is True
+
+
+def test_cli_sync_holds_back_incy_with_a_new_certificate(
+    happ_sub_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("happ_keys.incy.inspect_apk", lambda _path: _incy_apk(certs=(FAKE_CERT,)))
+    args = _write_extraction(tmp_path, _reference_keys(), list(_happ_signers().certs))
+    pr_body = tmp_path / "pr.md"
+
+    result = _run_sync(
+        happ_sub_repo,
+        [
+            *args,
+            *("--incy-version", "3.7.9", "--incy-version-code", "379", "--incy-desktop-version", "3.9.0"),
+            *("--incy-apk", str(tmp_path / "Incy.apk")),
+        ],
+        pr_body,
+        capsys,
+    )
+
+    # Incy Desktop still moves; Incy Android and its signers stay for a person to regenerate.
+    assert happ_sub.load_release(happ_sub_repo).incy == HAPP_471.incy
+    assert happ_sub.load_release(happ_sub_repo).incy_desktop == INCY_DESKTOP_390
+    assert "src/incy_signers.rs" not in result["written"]
+    assert result["incy_problems"]
+    assert result["incy_verified"] is False
+    body = pr_body.read_text(encoding="utf-8")
+    assert f"## {happ_sub.INCY_HELD_BACK_SECTION}: its APK no longer matches happ-sub" in body
 
 
 def test_missing_release_rs_is_a_format_error(happ_sub_repo: Path) -> None:

@@ -31,7 +31,15 @@ def test_parse_incy_tags() -> None:
     assert desktop.parse_incy_desktop_tag("desktop-v3.8.10") == "3.8.10"
 
 
-def test_release_sync_updates_release_rs(happ_sub_repo: Path, tmp_path: Path) -> None:
+def _snapshot_incy_apk(version: str, version_code: int) -> happ_sub.IncyApk:
+    source = (SNAPSHOT_DIR / "src" / "incy_signers.rs").read_text(encoding="utf-8")
+    (cert,) = (happ_sub._parse_byte_array(m["body"], m["name"]) for m in happ_sub._CERT_CONST_RE.finditer(source))
+    pins = happ_sub.load_incy_pins(SNAPSHOT_DIR)
+    return happ_sub.IncyApk(version, version_code, pins.scheme, (cert,), pins.keymat_a, pins.keymat_b)
+
+
+def test_release_sync_updates_release_rs(happ_sub_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("happ_keys.incy.inspect_apk", lambda _path: _snapshot_incy_apk("3.8.0", 380))
     pr_body = tmp_path / "pr.md"
     code = main(
         [
@@ -44,6 +52,8 @@ def test_release_sync_updates_release_rs(happ_sub_repo: Path, tmp_path: Path) ->
             "380",
             "--incy-desktop-version",
             "3.8.11",
+            "--incy-apk",
+            str(tmp_path / "Incy.apk"),
             "--write",
             "--pr-body",
             str(pr_body),
@@ -55,3 +65,19 @@ def test_release_sync_updates_release_rs(happ_sub_repo: Path, tmp_path: Path) ->
     assert release.incy_desktop == happ_sub.IncyDesktopRelease(version="3.8.11")
     assert "Incy Android" in pr_body.read_text(encoding="utf-8")
     assert "Incy Desktop" in pr_body.read_text(encoding="utf-8")
+    assert happ_sub.load_incy_pins(happ_sub_repo).apk_version == "3.8.0"
+
+
+def test_release_sync_without_incy_apk_holds_back_incy(happ_sub_repo: Path, tmp_path: Path) -> None:
+    pr_body = tmp_path / "pr.md"
+    code = main(
+        [
+            *("release-sync", "--repo", str(happ_sub_repo), "--write", "--pr-body", str(pr_body)),
+            *("--incy-version", "3.8.0", "--incy-version-code", "380", "--incy-desktop-version", "3.8.11"),
+        ]
+    )
+    assert code == 0
+    release = happ_sub.load_release(happ_sub_repo)
+    assert release.incy == happ_sub.IncyAndroidRelease(version="3.7.0", version_code=370)
+    assert release.incy_desktop == happ_sub.IncyDesktopRelease(version="3.8.11")
+    assert "Incy not updated: APK not checked" in pr_body.read_text(encoding="utf-8")

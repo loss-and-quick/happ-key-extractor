@@ -16,6 +16,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -803,6 +804,161 @@ def device_happ_version(repo: Path) -> str | None:
     return load_release(repo).version if (repo / RELEASE_RS).exists() else None
 
 
+# Incy's signing certificate and `incy://crypt1/` keymat are kept in happ-sub by hand: a change in either
+# is rare and moves crypto pins, so it goes to a person. The sync only checks each new Incy APK against
+# them and, when they are unchanged, moves `INCY_SIGNERS.apk_version` along with `INCY_VERSION`.
+INCY_SIGNERS_RS = Path("src") / "incy_signers.rs"
+INCY_KEYMAT_JSON = Path("src") / "keys" / "incy-keymat.json"
+_INCY_SIGNERS_RE = re.compile(
+    r"pub\s+const\s+INCY_SIGNERS\s*:\s*SignerSet\s*=\s*SignerSet\s*\{(?P<body>.*?)\}\s*;", re.S
+)
+_INCY_SHA_RE = re.compile(
+    r"pub\s+const\s+INCY_SIGNER_SHA256\s*:\s*\[\s*&str\s*;\s*\d+\s*\]\s*=\s*\[(?P<items>[^\]]*)\]\s*;"
+)
+_SHA256_ITEM_RE = re.compile(r'^"(?P<hex>[0-9a-f]{64})"$')
+
+
+@dataclass(frozen=True)
+class IncyPins:
+    """What happ-sub pins about Incy's APK: signer scheme, certificate digests and the crypt1 keymat."""
+
+    scheme: str
+    cert_sha256: tuple[str, ...]
+    apk_version: str
+    keymat_a: bytes
+    keymat_b: bytes
+
+
+@dataclass(frozen=True)
+class IncyApk:
+    """What an Incy release APK says about itself."""
+
+    version: str
+    version_code: int
+    scheme: str
+    certs: tuple[bytes, ...]
+    keymat_a: bytes
+    keymat_b: bytes
+
+
+def parse_incy_signers_rs(source: str) -> tuple[str, tuple[str, ...], str]:
+    """Return `INCY_SIGNERS`' scheme and apk_version and the `INCY_SIGNER_SHA256` pins from incy_signers.rs."""
+    block = _INCY_SIGNERS_RE.search(source)
+    if block is None:
+        raise HappSubFormatError("incy_signers.rs: cannot find `INCY_SIGNERS`")
+    scheme_m = _SCHEME_FIELD_RE.search(block["body"])
+    version_m = _VERSION_FIELD_RE.search(block["body"])
+    if scheme_m is None or version_m is None:
+        raise HappSubFormatError("incy_signers.rs: `INCY_SIGNERS` lacks scheme or apk_version")
+    if scheme_m["ident"] not in _SCHEME_BY_IDENT:
+        raise HappSubFormatError(f"incy_signers.rs: unknown SigScheme::{scheme_m['ident']}")
+    sha_m = _INCY_SHA_RE.search(source)
+    if sha_m is None:
+        raise HappSubFormatError("incy_signers.rs: cannot find `INCY_SIGNER_SHA256`")
+    digests: list[str] = []
+    for item in (i.strip() for i in sha_m["items"].split(",")):
+        if not item:
+            continue
+        m = _SHA256_ITEM_RE.match(item)
+        if m is None:
+            raise HappSubFormatError(f"incy_signers.rs: {item} is not a lower-case SHA-256 string literal")
+        digests.append(m["hex"])
+    if not digests:
+        raise HappSubFormatError("incy_signers.rs: `INCY_SIGNER_SHA256` is empty")
+    return _SCHEME_BY_IDENT[scheme_m["ident"]], tuple(digests), version_m["version"]
+
+
+def load_incy_pins(repo: Path) -> IncyPins:
+    signers_path = repo / INCY_SIGNERS_RS
+    keymat_path = repo / INCY_KEYMAT_JSON
+    for path in (signers_path, keymat_path):
+        if not path.is_file():
+            raise HappSubFormatError(f"{path.relative_to(repo).as_posix()} not found in the happ-sub checkout")
+    scheme, digests, apk_version = parse_incy_signers_rs(signers_path.read_text(encoding="utf-8"))
+    try:
+        keymat = json.loads(keymat_path.read_text(encoding="utf-8"))
+        keymat_a = base64.b64decode(keymat["keymat_a_b64"], validate=True)
+        keymat_b = base64.b64decode(keymat["keymat_b_b64"], validate=True)
+    except (ValueError, KeyError, TypeError, binascii.Error) as exc:
+        raise HappSubFormatError(f"{INCY_KEYMAT_JSON.as_posix()}: {exc}") from exc
+    return IncyPins(scheme, digests, apk_version, keymat_a, keymat_b)
+
+
+def incy_apk_problems(pins: IncyPins, apk: IncyApk, tag_version: str) -> list[str]:
+    """Each way the APK differs from what happ-sub pins; empty when the Incy bump is safe to make."""
+    problems: list[str] = []
+    if apk.version != tag_version:
+        problems.append(f"the APK of the release tagged {tag_version} is Incy {apk.version}")
+    if apk.scheme != pins.scheme:
+        problems.append(f"the APK is signed with scheme {apk.scheme}, `INCY_SIGNERS` has {pins.scheme}")
+    digests = tuple(hashlib.sha256(der).hexdigest() for der in apk.certs)
+    if digests != pins.cert_sha256:
+        problems.append(
+            f"the signing certificates have SHA-256 {', '.join(digests)}, "
+            f"`INCY_SIGNER_SHA256` pins {', '.join(pins.cert_sha256)}"
+        )
+    if (apk.keymat_a, apk.keymat_b) != (pins.keymat_a, pins.keymat_b):
+        problems.append(f"the incy://crypt1/ keymat assets differ from `{INCY_KEYMAT_JSON.as_posix()}`")
+    return problems
+
+
+@dataclass(frozen=True)
+class IncyGate:
+    """Outcome of checking a new Incy Android release before its constants are synced."""
+
+    release: IncyAndroidRelease | None = None
+    # The APK no longer matches happ-sub's pins: a person has to regenerate them.
+    problems: tuple[str, ...] = ()
+    # The APK could not be checked (not downloaded): the bump waits for a later run.
+    unverified: str | None = None
+    # An APK was read and matches happ-sub's pins; only then may a pin-mismatch issue be closed.
+    verified: bool = False
+
+
+def gate_incy_release(repo: Path, wanted: IncyAndroidRelease | None, apk: IncyApk | None) -> IncyGate:
+    """Let a new Incy Android release through only when its APK matches happ-sub's certificate and keymat.
+
+    The versionCode is taken from the APK, not from the tag, since the tag only carries the version name.
+    """
+    if wanted is None:
+        return IncyGate()
+    previous = load_release(repo).incy
+    if apk is None:
+        if previous is not None and previous.version == wanted.version:
+            return IncyGate()
+        return IncyGate(unverified=f"Incy {wanted.version} was not checked: its APK is not available")
+    problems = incy_apk_problems(load_incy_pins(repo), apk, wanted.version)
+    if problems:
+        return IncyGate(problems=tuple(problems))
+    release = IncyAndroidRelease(version=apk.version, version_code=apk.version_code)
+    _check_incy_android_release(release)
+    return IncyGate(release=release, verified=True)
+
+
+def update_incy_signers_rs(source: str, version: str) -> str:
+    """Move `INCY_SIGNERS.apk_version` to `version`; the certificate and its pins stay as they are."""
+    _check_version(version)
+    block = _INCY_SIGNERS_RE.search(source)
+    if block is None:
+        raise HappSubFormatError("incy_signers.rs: cannot find `INCY_SIGNERS`")
+    body, count = _VERSION_FIELD_RE.subn(f'apk_version: "{version}"', block["body"], count=1)
+    if count != 1:
+        raise HappSubFormatError("incy_signers.rs: `INCY_SIGNERS` lacks apk_version")
+    return source[: block.start("body")] + body + source[block.end("body") :]
+
+
+def _incy_signers_write(repo: Path, previous: Release | None, release: Release) -> list[tuple[Path, str]]:
+    """incy_signers.rs follows a new Incy Android version, as signers.rs follows Happ's."""
+    if release.incy is None or (previous is not None and previous.incy == release.incy):
+        return []
+    path = repo / INCY_SIGNERS_RS
+    if not path.is_file():
+        raise HappSubFormatError(f"{INCY_SIGNERS_RS.as_posix()} not found in the happ-sub checkout")
+    source = path.read_text(encoding="utf-8")
+    updated = update_incy_signers_rs(source, release.incy.version)
+    return [] if updated == source else [(path, updated)]
+
+
 def _join_words(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
@@ -862,6 +1018,9 @@ class SyncPlan:
     release: Release | None = None
     previous_release: Release | None = None
     release_unknown: bool = False
+    incy_problems: tuple[str, ...] = ()
+    incy_unverified: str | None = None
+    incy_verified: bool = False
 
     @property
     def sync_sha256(self) -> str:
@@ -903,6 +1062,9 @@ class SyncPlan:
             "title": self.title,
             "changed_ids": list(self.changed_ids),
             "previous_generation": self.previous_generation,
+            "incy_problems": list(self.incy_problems),
+            "incy_unverified": self.incy_unverified,
+            "incy_verified": self.incy_verified,
         }
 
 
@@ -932,8 +1094,13 @@ def plan_sync(
     desktop: HappDesktopRelease | None = None,
     incy: IncyAndroidRelease | None = None,
     incy_desktop: IncyDesktopRelease | None = None,
+    incy_gate: IncyGate | None = None,
 ) -> SyncPlan:
-    """Compare an extracted table, and if given the signer set and release constants, with happ-sub."""
+    """Compare an extracted table, and if given the signer set and release constants, with happ-sub.
+
+    `incy_gate` carries why an Incy Android release was held back (see `gate_incy_release`); pass its
+    `release` as `incy`.
+    """
     tables = load_tables(repo)
     digest = table_sha256(entries)
     match = find_matching_table(entries, tables)
@@ -982,6 +1149,9 @@ def plan_sync(
         "release": release,
         "previous_release": previous_release,
         "release_unknown": release_unknown,
+        "incy_problems": incy_gate.problems if incy_gate is not None else (),
+        "incy_unverified": incy_gate.unverified if incy_gate is not None else None,
+        "incy_verified": incy_gate.verified if incy_gate is not None else False,
     }
 
     generation: int | None = None
@@ -1042,6 +1212,7 @@ def apply_sync(repo: Path, plan: SyncPlan, entries: KeyTableEntries) -> list[Pat
     if plan.release_drift and plan.release is not None:
         release_path = repo / RELEASE_RS
         writes.append((release_path, update_release_rs(release_path.read_text(encoding="utf-8"), plan.release)))
+        writes += _incy_signers_write(repo, plan.previous_release, plan.release)
     for path, text in writes:
         path.write_text(text, encoding="utf-8")
     return [path for path, _ in writes]
@@ -1131,6 +1302,30 @@ def _release_unknown_section() -> list[str]:
     ]
 
 
+INCY_HELD_BACK_SECTION = "Incy not updated"
+
+
+def _incy_held_back_section(problems: tuple[str, ...], unverified: str | None) -> list[str]:
+    if problems:
+        return [
+            f"## {INCY_HELD_BACK_SECTION}: its APK no longer matches happ-sub",
+            "",
+            *(f"- {problem}" for problem in problems),
+            "",
+            f"`INCY_VERSION` stays where it is. `{INCY_SIGNERS_RS.as_posix()}` and "
+            f"`{INCY_KEYMAT_JSON.as_posix()}` have to be regenerated from the new APK by hand, since they move "
+            "the SSAID and `incy://crypt1/` pins.",
+        ]
+    if unverified:
+        return [
+            f"## {INCY_HELD_BACK_SECTION}: APK not checked",
+            "",
+            f"{unverified}. `INCY_VERSION` moves only after the APK's signing certificate and keymat are "
+            "compared with happ-sub's; a later run retries.",
+        ]
+    return []
+
+
 def build_pr_body(plan: SyncPlan, meta: Mapping[str, Any], report: Mapping[str, Any], run_url: str | None) -> str:
     lines: list[str] = []
     if plan.keys_drift:
@@ -1167,6 +1362,8 @@ def build_pr_body(plan: SyncPlan, meta: Mapping[str, Any], report: Mapping[str, 
         lines += [*_release_section(plan), ""]
     if plan.release_unknown:
         lines += [*_release_unknown_section(), ""]
+    if held_back := _incy_held_back_section(plan.incy_problems, plan.incy_unverified):
+        lines += [*held_back, ""]
     lines += [
         f"- APK version: {meta.get('app_version')} (versionCode {meta.get('versionCode')})",
         f"- APK SHA-256: `{meta.get('apk_sha256')}`",
@@ -1207,6 +1404,9 @@ class ReleaseSyncPlan:
     desktop_drift: bool = False
     incy_drift: bool = False
     incy_desktop_drift: bool = False
+    incy_problems: tuple[str, ...] = ()
+    incy_unverified: str | None = None
+    incy_verified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1214,6 +1414,9 @@ class ReleaseSyncPlan:
             "branch": self.branch,
             "title": self.title,
             "sync_sha256": self.sync_sha256,
+            "incy_problems": list(self.incy_problems),
+            "incy_unverified": self.incy_unverified,
+            "incy_verified": self.incy_verified,
             "happ_drift": self.happ_drift,
             "desktop_drift": self.desktop_drift,
             "incy_drift": self.incy_drift,
@@ -1238,8 +1441,14 @@ def plan_release_sync(
     desktop: HappDesktopRelease | None = None,
     incy: IncyAndroidRelease | None = None,
     incy_desktop: IncyDesktopRelease | None = None,
+    incy_gate: IncyGate | None = None,
 ) -> ReleaseSyncPlan:
     """Compare desired platform release versions against a happ-sub checkout's release.rs."""
+    held_back: dict[str, Any] = {
+        "incy_problems": incy_gate.problems if incy_gate is not None else (),
+        "incy_unverified": incy_gate.unverified if incy_gate is not None else None,
+        "incy_verified": incy_gate.verified if incy_gate is not None else False,
+    }
     previous = load_release(repo)
     target = Release(
         version=happ.version if happ is not None else previous.version,
@@ -1254,7 +1463,7 @@ def plan_release_sync(
 
     platforms = _drifted_platforms(previous, target)
     if not platforms:
-        return ReleaseSyncPlan(drift=False, release=target, previous_release=previous)
+        return ReleaseSyncPlan(drift=False, release=target, previous_release=previous, **held_back)
     names = {name for name, _ in platforms}
     happ_drift = "Happ" in names
     desktop_drift = "Happ Desktop" in names
@@ -1274,6 +1483,7 @@ def plan_release_sync(
         desktop_drift=desktop_drift,
         incy_drift=incy_drift,
         incy_desktop_drift=incy_desktop_drift,
+        **held_back,
     )
 
 
@@ -1281,9 +1491,11 @@ def apply_release_sync(repo: Path, plan: ReleaseSyncPlan) -> list[Path]:
     if not plan.drift or plan.release is None:
         return []
     release_path = repo / RELEASE_RS
-    updated = update_release_rs(release_path.read_text(encoding="utf-8"), plan.release)
-    _ = release_path.write_text(updated, encoding="utf-8")
-    return [release_path]
+    writes = [(release_path, update_release_rs(release_path.read_text(encoding="utf-8"), plan.release))]
+    writes += _incy_signers_write(repo, plan.previous_release, plan.release)
+    for path, text in writes:
+        _ = path.write_text(text, encoding="utf-8")
+    return [path for path, _ in writes]
 
 
 def build_release_pr_body(plan: ReleaseSyncPlan, run_url: str | None = None) -> str:
@@ -1324,6 +1536,8 @@ def build_release_pr_body(plan: ReleaseSyncPlan, run_url: str | None = None) -> 
         "",
         f"`{RELEASE_RS.as_posix()}` was updated in place.",
     ]
+    if held_back := _incy_held_back_section(plan.incy_problems, plan.incy_unverified):
+        lines += ["", *held_back]
     if run_url:
         lines += ["", f"- Run: {run_url}"]
     if plan.sync_sha256:

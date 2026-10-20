@@ -19,11 +19,15 @@ import secrets
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+if TYPE_CHECKING:
+    from happ_keys.happ_sub import IncyApk
+
+PACKAGE_NAME: str = "llc.itdev.incy"
 PREFIX: str = "incy://crypt1/"
 KEYMAT_ASSETS: tuple[str, str] = ("res/raw/incy_assets_a.bin", "res/raw/incy_assets_b.bin")
 KEYMAT_A_OFFSET: int = 1024
@@ -100,6 +104,37 @@ def read_keymat(apk_path: Path | str) -> IncyKeymat:
             except KeyError as exc:
                 raise IncyKeymatError(f"missing asset: {entry}") from exc
     return IncyKeymat(a=blobs[0], b=blobs[1], source=str(apk_path))
+
+
+def inspect_apk(apk_path: Path | str) -> IncyApk:
+    """Read the version, the SSAID signers and the keymat of an INCY release APK."""
+    try:
+        from loguru import logger
+
+        logger.disable("androguard")
+    except ImportError:
+        pass
+    from androguard.core.apk import APK
+
+    from happ_keys.apk_signer import get_ssaid_signers
+    from happ_keys.happ_sub import IncyApk
+
+    apk = APK(str(apk_path))
+    if apk.get_package() != PACKAGE_NAME:
+        raise IncyKeymatError(f"{apk_path} is {apk.get_package()}, not {PACKAGE_NAME}")
+    version, version_code = apk.get_androidversion_name(), apk.get_androidversion_code()
+    if not version or not version_code or not str(version_code).isdigit():
+        raise IncyKeymatError(f"{apk_path} has no usable versionName/versionCode")
+    scheme, certs = get_ssaid_signers(apk)
+    keymat = read_keymat(apk_path)
+    return IncyApk(
+        version=str(version),
+        version_code=int(version_code),
+        scheme=scheme,
+        certs=tuple(certs),
+        keymat_a=keymat.a,
+        keymat_b=keymat.b,
+    )
 
 
 def derive_key(keymat: IncyKeymat, *, verify: bool = True) -> bytes:

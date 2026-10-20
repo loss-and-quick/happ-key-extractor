@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -146,6 +147,19 @@ def run_fetch_apks(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _gate_incy(repo: Path, wanted: happ_sub.IncyAndroidRelease | None, apk_path: str | None) -> happ_sub.IncyGate:
+    """Check a new Incy Android release against happ-sub's pins; an unreadable APK counts as unchecked."""
+    import happ_keys.incy as incy
+
+    apk = None
+    if wanted is not None and apk_path:
+        try:
+            apk = incy.inspect_apk(apk_path)
+        except (OSError, ValueError, zipfile.BadZipFile, incy.IncyKeymatError) as exc:
+            print(f"Warning: cannot read the Incy APK {apk_path}: {exc}", file=sys.stderr)
+    return happ_sub.gate_incy_release(repo, wanted, apk)
+
+
 def run_happ_sub_sync(args: argparse.Namespace) -> int:
     keys = json.loads(Path(args.keys).read_text(encoding="utf-8"))
     meta = json.loads(Path(args.meta).read_text(encoding="utf-8"))
@@ -183,6 +197,7 @@ def run_happ_sub_sync(args: argparse.Namespace) -> int:
         incy_rel = None
         if getattr(args, "incy_version", None) and getattr(args, "incy_version_code", None):
             incy_rel = happ_sub.IncyAndroidRelease(version=args.incy_version, version_code=int(args.incy_version_code))
+        incy_gate = _gate_incy(repo, incy_rel, getattr(args, "incy_apk", None))
 
         incy_desktop_rel = None
         if getattr(args, "incy_desktop_version", None):
@@ -196,8 +211,9 @@ def run_happ_sub_sync(args: argparse.Namespace) -> int:
             release,
             release_unknown,
             desktop=desktop_rel,
-            incy=incy_rel,
+            incy=incy_gate.release,
             incy_desktop=incy_desktop_rel,
+            incy_gate=incy_gate,
         )
         written = happ_sub.apply_sync(repo, plan, entries) if args.write else []
     except happ_sub.HappSubFormatError as exc:
@@ -363,7 +379,7 @@ def run_release_sync(args: argparse.Namespace) -> int:
                 ua_suffix=args.desktop_suffix,
             )
 
-        incy_release = None
+        incy_release: happ_sub.IncyAndroidRelease | None = None
         incy_desktop_release = None
         if args.from_upstream_incy:
             info = desktop.fetch_latest_incy_releases()
@@ -378,12 +394,14 @@ def run_release_sync(args: argparse.Namespace) -> int:
             if args.incy_desktop_version:
                 incy_desktop_release = happ_sub.IncyDesktopRelease(version=args.incy_desktop_version)
 
+        incy_gate = _gate_incy(repo, incy_release, args.incy_apk)
         plan = happ_sub.plan_release_sync(
             repo,
             happ=happ_release,
             desktop=desktop_release,
-            incy=incy_release,
+            incy=incy_gate.release,
             incy_desktop=incy_desktop_release,
+            incy_gate=incy_gate,
         )
         written = happ_sub.apply_release_sync(repo, plan) if args.write else []
     except (happ_sub.HappSubFormatError, desktop.DesktopExtractError) as exc:
@@ -490,6 +508,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     sync_p.add_argument("--incy-version", help="Incy Android version to sync into release.rs")
     sync_p.add_argument("--incy-version-code", type=int, help="Incy Android versionCode")
     sync_p.add_argument("--incy-desktop-version", help="Incy Desktop version to sync into release.rs")
+    sync_p.add_argument(
+        "--incy-apk",
+        help="Incy.apk of --incy-version; a new Incy version is synced only if its certificate and keymat match",
+    )
     sync_p.add_argument("--repo", required=True, help="Path to a happ-sub checkout")
     sync_p.add_argument(
         "--write",
@@ -525,6 +547,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     release_sync_p.add_argument("--incy-version-code", type=int, help="Incy Android versionCode")
     release_sync_p.add_argument("--incy-desktop-version", help="Incy Desktop version")
     release_sync_p.add_argument("--from-upstream-incy", action="store_true")
+    release_sync_p.add_argument(
+        "--incy-apk",
+        help="Incy.apk of the Incy Android version; it is synced only if its certificate and keymat match",
+    )
     release_sync_p.add_argument("--write", action="store_true", help="Write src/release.rs on drift")
     release_sync_p.add_argument("--pr-body", help="Write a pull request body (Markdown) here on drift")
     release_sync_p.add_argument("--run-url", help="CI run URL to cite in the pull request body")
