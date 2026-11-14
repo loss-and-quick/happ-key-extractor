@@ -179,7 +179,7 @@ jobs:
           HAPP_SUB_PR_TOKEN: ${{ secrets.HAPP_SUB_PR_TOKEN }}
         run: |
           if [ -z "$HAPP_SUB_PR_TOKEN" ]; then
-            echo "::error title=Missing secret::HAPP_SUB_PR_TOKEN is not set. Add a fine-grained PAT scoped to $HAPP_SUB_REPO with Contents and Pull requests read/write."
+            echo "::error title=Missing secret::HAPP_SUB_PR_TOKEN is not set. Add a fine-grained PAT scoped to $HAPP_SUB_REPO with Contents read/write."
             exit 1
           fi
 
@@ -298,54 +298,55 @@ jobs:
           Regenerate \`src/incy_signers.rs\` (with \`happ_keys.apk_signer.get_ssaid_signers\`) or \`src/keys/incy-keymat.json\` (with \`python -m happ_keys incy derive --apk Incy.apk -o ...\`) in happ-sub by hand: both move the SSAID and \`incy://crypt1/\` pins.
           EOF
 
-      - name: Open or update the happ-sub pull request
+      - name: Commit and push updates to happ-sub main
+        id: commit_happ_sub
         if: steps.sync.outputs.drift == 'true'
         working-directory: happ-sub
         env:
-          GH_TOKEN: ${{ secrets.HAPP_SUB_PR_TOKEN }}
-          BRANCH: ${{ steps.sync.outputs.branch }}
           TITLE: ${{ steps.sync.outputs.title }}
           SYNC_SHA: ${{ steps.sync.outputs.sync_sha256 }}
-          VERSION: ${{ steps.sync.outputs.version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          open_prs=$(gh pr list --repo "$HAPP_SUB_REPO" --state open --limit 100 --json number,headRefName,body)
-          # An open PR whose digest (table, signers, release constants) matches carries this very change:
-          # weekly runs comment on it instead of duplicating it.
-          same=$(jq -r --arg m "happ-sub-sync-sha256: $SYNC_SHA" \
-            'map(select(.body | contains($m))) | .[0].number // empty' <<<"$open_prs")
-          if [ -n "$same" ]; then
-            gh pr comment "$same" --repo "$HAPP_SUB_REPO" \
-              --body "Same change still observed in Happ $VERSION (digest \`$SYNC_SHA\`): $RUN_URL"
-            exit 0
-          fi
-          # An open PR on the same branch with another digest carries an older change, e.g. a build re-issued
-          # under the same version. Never push over it, it may hold manual fixes: open this change beside it.
-          pr_on() { jq -r --arg b "$1" 'map(select(.headRefName == $b)) | .[0].number // empty' <<<"$open_prs"; }
-          stale=$(pr_on "$BRANCH")
-          if [ -n "$stale" ]; then
-            BRANCH="$BRANCH-${SYNC_SHA:0:8}"
-            # Only a branch without an open PR is force-pushed (a merged PR's leftover branch is fine).
-            occupied=$(pr_on "$BRANCH")
-            if [ -n "$occupied" ]; then
-              echo "::warning::#$occupied already uses $BRANCH; not pushing over it"
-              gh pr comment "$occupied" --repo "$HAPP_SUB_REPO" \
-                --body "This change (digest \`$SYNC_SHA\`) is still observed, but this PR's body lost its digest marker, so it was not updated: $RUN_URL"
-              exit 0
-            fi
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
           git add src/keys src/device src/release.rs src/incy_signers.rs
-          git commit -m "$TITLE" -m "Synced by $RUN_URL"
-          git push --force origin "$BRANCH"
-          url=$(gh pr create --repo "$HAPP_SUB_REPO" --base main --head "$BRANCH" \
-            --title "$TITLE" --body-file ../out/pr-body.md)
-          if [ -n "$stale" ]; then
-            gh pr comment "$stale" --repo "$HAPP_SUB_REPO" \
-              --body "Superseded by $url: the upstream build changed again under the same version (digest \`$SYNC_SHA\`)."
+          if git diff --cached --quiet; then
+            echo "No changes staged to commit in happ-sub."
+            exit 0
           fi
+          git commit -m "$TITLE" -m "Synced by $RUN_URL" -m "happ-sub-sync-sha256: $SYNC_SHA"
+          git push origin main
+
+      - name: Track happ-sub push failure issue
+        if: failure() && steps.sync.outputs.drift == 'true' && steps.commit_happ_sub.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: ${{ steps.sync.outputs.title }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --state open --limit 100 --json number,title \
+            | jq -r --arg t "happ-sub push failed: $TITLE" 'map(select(.title == $t)) | .[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Push to happ-sub failed again: $RUN_URL"
+            exit 0
+          fi
+          gh issue create --title "happ-sub push failed: $TITLE" --body-file - <<EOF
+          Automated push to \`$HAPP_SUB_REPO\` main branch failed.
+
+          - Title: $TITLE
+          - Run: $RUN_URL
+
+          Check permissions and secrets for \`$HAPP_SUB_REPO\`.
+          EOF
+
+      - name: Trigger Kasumi-Proxy dependency sync
+        if: steps.sync.outputs.drift == 'true' && steps.commit_happ_sub.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.HAPP_SUB_PR_TOKEN }}
+        run: |
+          gh api repos/loss-and-quick/Kasumi-Proxy/dispatches \
+            -f event_type=happ-sub-updated || echo "::warning::Could not dispatch event to Kasumi-Proxy (token may not have Kasumi-Proxy scope; scheduled workflow will sync)"
 
   crypt5-canary:
     name: crypt5 canary
